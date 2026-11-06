@@ -4,23 +4,69 @@
 
 你在對話裡說「幫我畫一隻狐狸法師」，Claude 畫好後先自己看圖檢查，再交給你在面板上核准或要求修改。每個素材有自己的版本紀錄，改圖時接回同一段 Codex 對話，主體和構圖不會跑掉。
 
-## 需要什麼
-
-- [Claude Code](https://claude.com/claude-code)
-- 官方 [Codex CLI](https://github.com/openai/codex)，用 ChatGPT 帳號登入
-- `ffmpeg`，用來產生面板的縮圖
-
 ## 安裝
 
-在 Claude Code 裡：
+**支援 Linux 與 Windows 的 WSL。** macOS 和 Windows 原生目前跑不起來，因為 easel 用到 GNU 版的 `find`、`base64`、`timeout`。
 
-```text
-/plugin marketplace add MiskaWu/easel
-/plugin install easel@easel
-/reload-plugins
+### 1. 先準備兩個工具
+
+官方 [Codex CLI](https://github.com/openai/codex)：
+
+```bash
+curl -fsSL https://chatgpt.com/codex/install.sh | sh
 ```
 
-打開 `/easel`。還沒登入 Codex 的話，面板會帶你用裝置碼登入，手機也能完成。
+`ffmpeg`，用來產生面板的縮圖：
+
+```bash
+sudo apt install ffmpeg
+```
+
+Codex 登入不用現在做，第一次打開面板時會帶你用裝置碼登入，手機也能完成。要先到 ChatGPT 的安全性設定開啟裝置碼登入，否則頁面會顯示沒有開啟。
+
+### 2. 裝 easel
+
+三種方式擇一，都不用改任何設定檔。
+
+**A. 請 Claude 幫你裝**：在任何一個 Claude Code 對話（桌面 app 的 Code 分頁也可以）輸入：
+
+> 請照 https://github.com/MiskaWu/easel README 的「給 Claude 的安裝步驟」幫我安裝
+
+**B. 自己在終端機裝**（電腦上有 `claude` 指令的話）：
+
+```bash
+claude plugin marketplace add MiskaWu/easel && claude plugin install easel@easel
+```
+
+或在終端機版 Claude Code 的輸入框打 `/plugin install easel --marketplace MiskaWu/easel`，問 `Add marketplace?` 時回 `y`，範圍選 user。
+
+**C. 桌面 app**（`/plugin` 在桌面 app 不能用）：按輸入框旁的 **+** → **Plugins** → **Add marketplace**，填 `MiskaWu/easel`，再 **Add plugin**。
+
+### 3. 開始用
+
+輸入 `/reload-plugins`（或開一個新對話）讓它生效，再輸入 `/easel` 打開面板。
+
+### 更新
+
+```bash
+claude plugin marketplace update easel && claude plugin update easel@easel
+```
+
+或在 `/plugin` → **Marketplaces** → **easel** → **Enable auto-update** 打開自動更新。
+
+### 給 Claude 的安裝步驟
+
+照下面做，不要改 `settings.json`，也不要替使用者登入 Codex。
+
+1. 確認是 Linux 或 WSL。macOS 或 Windows 原生就停下來，告訴使用者目前不支援。
+2. 決定用哪個 `claude`：`command -v claude` 有結果就用它；沒有的話用環境變數 `$CLAUDE_CODE_EXECPATH`
+   （目前這個 Claude Code 本身，桌面 app 的 Code 分頁裡也有）。以下記作 `$CLAUDE`。
+3. 加入 marketplace：`"$CLAUDE" plugin marketplace add MiskaWu/easel`。
+   已經加過的話改跑 `"$CLAUDE" plugin marketplace update easel`。
+4. 安裝：`"$CLAUDE" plugin install easel@easel`。已經裝過的話改跑 `"$CLAUDE" plugin update easel@easel`。
+5. 用 `"$CLAUDE" plugin list` 確認 `easel@easel` 是 enabled。
+6. 檢查 `codex --version` 和 `ffmpeg -version`，缺哪個就把「先準備兩個工具」那段的指令給使用者。
+7. 告訴使用者：先輸入 `/reload-plugins`（或開一個新對話），再輸入 `/easel` 打開面板並登入。
 
 ## 怎麼用
 
@@ -44,6 +90,7 @@ easel 只執行官方 `codex`，不讀 `~/.codex/auth.json`，也不自己呼叫
 
 ## 限制
 
+- 只支援 Linux 與 WSL。
 - 只能在 Claude Code 裡用，排程或純終端機叫不動。
 - 手機面板沒有輸入框，想修改請在對話裡說。
 - 官方的 `openai/codex-plugin-cc` 是程式碼審查與代辦用，跟 easel 可以並存。
