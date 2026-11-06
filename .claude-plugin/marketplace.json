@@ -1,0 +1,12 @@
+{
+  "name": "easel",
+  "owner": { "name": "MiskaWu", "url": "https://github.com/MiskaWu" },
+  "metadata": { "description": "用官方 Codex 生圖，在 Claude 裡審稿。", "version": "0.1.0" },
+  "plugins": [
+    {
+      "name": "easel",
+      "source": "./mod",
+      "description": "用官方 Codex 生圖，在 Claude 裡看圖、審稿與看 Codex 額度（/easel）。"
+    }
+  ]
+}
