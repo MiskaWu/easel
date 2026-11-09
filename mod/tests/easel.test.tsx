@@ -192,7 +192,7 @@ test('沒裝 Codex 時教他裝，沒登入時給登入鈕', async ($, on) => {
   await start($)
   await openPane($)
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect(await seen(ui, /make install TAGS=codex/)).toBe(true)
+  expect(await seen(ui, /curl -fsSL https:\/\/chatgpt\.com\/codex\/install\.sh \| sh/)).toBe(true)
   await ui.unmount()
 })
 

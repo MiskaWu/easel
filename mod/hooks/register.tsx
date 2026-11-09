@@ -164,9 +164,11 @@ async function clearNotice($: $, asset: string): Promise<void> {
   await update($, noticesAtom, list => list.filter(n => n.asset !== asset))
 }
 
+const CODEX_INSTALL_COMMAND = 'curl -fsSL https://chatgpt.com/codex/install.sh | sh'
+
 async function ready($: $): Promise<string | null> {
   const setup = await refreshSetup($)
-  if (setup.state === 'missing') return '這台電腦找不到官方 Codex。請在 dev-env-ansible 跑 make install TAGS=codex。'
+  if (setup.state === 'missing') return `這台電腦找不到官方 Codex。請在終端機跑官方安裝指令：${CODEX_INSTALL_COMMAND}`
   if (setup.state === 'logged-out') return 'Codex 還沒登入。請對方打開 /easel 面板完成登入。'
   return null
 }
@@ -520,11 +522,11 @@ export const register: Register = on => {
             frame(
               'setup-missing',
               'warning',
-              <Text>這台電腦找不到官方 Codex。請在 dev-env-ansible 安裝：</Text>,
-              <Text>make install TAGS=codex</Text>,
+              <Text>這台電腦找不到官方 Codex。請在終端機跑官方安裝指令：</Text>,
+              <Text>{CODEX_INSTALL_COMMAND}</Text>,
               row(
                 'setup-btns',
-                <Button key="copy-install" label="複製指令" onPress={() => $.ui.copy({ text: 'make install TAGS=codex' })} />,
+                <Button key="copy-install" label="複製指令" onPress={() => $.ui.copy({ text: CODEX_INSTALL_COMMAND })} />,
                 <Button key="recheck" label="重新檢查" onPress={() => refreshSetup($)} />,
               ),
             ),
