@@ -1,6 +1,6 @@
 {
   "name": "easel",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": { "name": "MiskaWu", "url": "https://github.com/MiskaWu" },
   "types": "./types/index.d.ts",
   "description": "用官方 Codex 生圖，在 Claude 裡看圖、審稿與看 Codex 額度（/easel）。"
