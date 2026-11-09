@@ -4,6 +4,46 @@
 
 你在對話裡說「幫我畫一隻狐狸法師」，Claude 畫好後先自己看圖檢查，再交給你在面板上核准或要求修改。每個素材有自己的版本紀錄，改圖時接回同一段 Codex 對話，主體和構圖不會跑掉。
 
+## 用起來長這樣
+
+1. **說一句話。** 在對話裡告訴 Claude 想畫什麼，例如「幫我畫一隻抱著發光水晶的小狐狸法師，透明背景」。
+2. **Claude 畫完先自己檢查。** 它看過圖、對照你的要求，再把結果和結論放上面板。
+3. **你決定要不要。** 按核准，或直接打字說要改哪裡，下一版會以這一版為底。
+
+<table>
+<tr>
+<td valign="top" width="50%">
+
+**面板首頁**：額度、等你審的素材、正在畫的進度。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/panel-home-dark.webp">
+  <img src="docs/images/panel-home-light.webp" width="380" alt="easel 面板首頁：額度量表、一張等你審的小狐狸法師、正在畫的小木屋與已核准的素材清單">
+</picture>
+
+**兩版並排**：只改圍巾，背景和姿勢都沒跑掉。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/panel-compare-dark.webp">
+  <img src="docs/images/panel-compare-light.webp" width="380" alt="兩版並排比較：左邊狐狸圍藍色圍巾，右邊只有圍巾變成紅色，背景與姿勢相同">
+</picture>
+
+</td>
+<td valign="top" width="50%">
+
+**審稿**：大圖、版本條、Claude 的自檢結論，核准或打字要求修改。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/panel-review-dark.webp">
+  <img src="docs/images/panel-review-light.webp" width="380" alt="審稿頁：透明背景的小狐狸法師大圖、v1 與 v2 版本條、這一版的修改要求與自檢結論，以及核准、退回與修改輸入框">
+</picture>
+
+</td>
+</tr>
+</table>
+
+<sub>圖裡的素材都是 Codex 實際畫出來的。畫面由面板本身的繪圖程式產生，按鈕與額度數字是示意。</sub>
+
 ## 安裝
 
 **支援 Linux 與 Windows 的 WSL。** macOS 和 Windows 原生目前跑不起來，因為 easel 用到 GNU 版的 `find`、`base64`、`timeout`。
