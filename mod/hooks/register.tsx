@@ -6,10 +6,10 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderElement, Timer } from 'claude-code'
 
-import type { EaselJob, EaselLogin, EaselMeta, EaselNotice, EaselSetup, EaselUsage, EaselVersion, EaselView } from '../types'
+import type { EaselJob, EaselLogin, EaselMeta, EaselNotice, EaselSetup, EaselStartupProblem, EaselUsage, EaselVersion, EaselView } from '../types'
 import { assetDir, checkSetup, dropLock, draw, fetchImageTimes, fetchUsage, homeDir, loadAssets, loadMeta, openFile, projectRoot, saveMeta, takeLock, thumbnail } from './codex'
 import type { CodexStream } from './codex'
-import { ROOT, ago, codexArgv, emptyMeta, findVersion, isDirectImageCall, isValidName, latest, newArgv, newPrompt, nextVersion, parseDeviceAuth, patchVersion, planName, reviseArgv, revisePrompt, usageView } from './model'
+import { ROOT, ago, codexArgv, codexInstall, codexMissingText, emptyMeta, findVersion, isDirectImageCall, isValidName, latest, newArgv, newPrompt, nextVersion, parseDeviceAuth, patchVersion, planName, reviseArgv, revisePrompt, thumbnailer, usageView } from './model'
 import type { UsageView } from './model'
 import { STEPS, alertCard, assetCard, assetRow, bigPicture, compare, hero, jobCard, loginCode, setupRow, versionInfo, versionThumb } from './visual'
 import type { Drawing } from './visual'
@@ -29,6 +29,7 @@ const timesAtom = atom({ plugin: 'easel', key: 'imageTimes' } as const, [] as nu
 const setupAtom = atom({ plugin: 'easel', key: 'setup' } as const, { state: 'unknown', version: '' } as EaselSetup)
 const loginAtom = atom({ plugin: 'easel', key: 'login' } as const, { state: 'idle' } as EaselLogin)
 const noticesAtom = atom({ plugin: 'easel', key: 'notices' } as const, [] as EaselNotice[])
+const startupAtom = atom({ plugin: 'easel', key: 'startup' } as const, [] as EaselStartupProblem[])
 const tickAtom = atom({ plugin: 'easel', key: 'tick' } as const, 0)
 
 type NewInput = { asset?: string; prompt?: string; transparent?: boolean; refs?: string[] }
@@ -164,11 +165,11 @@ async function clearNotice($: $, asset: string): Promise<void> {
   await update($, noticesAtom, list => list.filter(n => n.asset !== asset))
 }
 
-const CODEX_INSTALL_COMMAND = 'curl -fsSL https://chatgpt.com/codex/install.sh | sh'
-
 async function ready($: $): Promise<string | null> {
+  // 啟動時沒找到這兩個位置就不能畫：素材會寫錯地方，畫好的圖也收不回來
+  if (!root || !home) return 'easel 啟動時沒找到專案或家目錄的位置，這次不能畫。請對方輸入 /reload-plugins 再試，並看 /easel 面板上的啟動訊息。'
   const setup = await refreshSetup($)
-  if (setup.state === 'missing') return `這台電腦找不到官方 Codex。請在終端機跑官方安裝指令：${CODEX_INSTALL_COMMAND}`
+  if (setup.state === 'missing') return codexMissingText(setup.platform ?? 'linux')
   if (setup.state === 'logged-out') return 'Codex 還沒登入。請對方打開 /easel 面板完成登入。'
   return null
 }
@@ -337,24 +338,84 @@ async function startLogin($: $): Promise<void> {
   })()
 }
 
+// ---- 啟動 ------------------------------------------------------------------
+
+async function locate($: $): Promise<void> {
+  // 用引擎的專案根，不用 e.cwd：工作目錄會跟著 shell 的 cd 變，素材不能跟著跑
+  root = await projectRoot($, await $.session.root())
+  home = await homeDir($)
+}
+
+async function loadState($: $): Promise<void> {
+  await refreshAssets($)
+  await refreshSetup($)
+  await refreshUsage($)
+}
+
+function pollUsage($: $): void {
+  $.clock.every(USAGE_EVERY_MS, () => {
+    refreshUsage($).catch(() => undefined)
+  })
+}
+
+/**
+ * 啟動時要做的事，一項一筆，照順序跑。每一項各自成敗：失敗只回報那一項，後面的照跑。
+ * 起因：這些原本寫成一串 await。/easel 指令被引擎拒絕（當時技能也叫 easel，先佔了 /easel）時整個 session.start 被跳過，
+ * 排在後面的四個工具跟著沒註冊，而且對話和面板上都看不到原因。
+ * 要加新的工具或指令就在這裡加一筆，不要回 session.start 手寫順序或 try/catch。
+ * 引擎不准把 $ 交給存在清單裡的函式，所以清單只放資料，實際呼叫由下面的 runStep 照 kind 對應；新的 kind 要在那裡補一行。
+ * when：register 在第一輪對話前做完，工具才趕得上第一輪；background 不擋開場，在背景做。
+ */
+type StartupStep = { label: string; when: 'register' | 'background' } & (
+  | { kind: 'tool'; spec: (typeof TOOLS)[number] }
+  | { kind: 'command'; spec: { name: string; description: string } }
+  | { kind: 'locate' | 'load-state' | 'poll-usage' }
+)
+
+const STARTUP: readonly StartupStep[] = [
+  ...TOOLS.map((spec): StartupStep => ({ label: `工具 ${spec.name}`, when: 'register', kind: 'tool', spec })),
+  { label: '找專案與家目錄', when: 'register', kind: 'locate' },
+  { label: '/easel 指令', when: 'register', kind: 'command', spec: { name: 'easel', description: '打開 easel：看圖、審稿與 Codex 額度' } },
+  { label: '讀取素材與 Codex 狀態', when: 'background', kind: 'load-state' },
+  { label: '定時更新額度', when: 'background', kind: 'poll-usage' },
+]
+
+async function runStep($: $, step: StartupStep): Promise<void> {
+  if (step.kind === 'tool') await $.tool.register(step.spec)
+  else if (step.kind === 'command') await $.command.register(step.spec)
+  else if (step.kind === 'locate') await locate($)
+  else if (step.kind === 'load-state') await loadState($)
+  else pollUsage($)
+}
+
+/** 跑清單裡某一段的每一項。失敗的寫一行到對話，並記進狀態給對話框上方、面板與 status 工具顯示。 */
+async function runStartup($: $, when: StartupStep['when']): Promise<void> {
+  const failed: EaselStartupProblem[] = []
+  for (const step of STARTUP) {
+    if (step.when !== when) continue
+    try {
+      await runStep($, step)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      failed.push({ label: step.label, message })
+      $.ui.log(`easel 啟動時「${step.label}」沒成功：${message}`)
+    }
+  }
+  try {
+    // register 是每次啟動的第一段，順便清掉上次啟動留下的紀錄
+    await update($, startupAtom, list => (when === 'register' ? failed : [...list, ...failed]))
+  } catch (error) {
+    $.ui.log(`easel 記不下啟動結果：${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
 export const register: Register = on => {
   // ---- 引擎事件 --------------------------------------------------------------
 
   on('session.start', async ($, e, next) => {
-    // 用引擎的專案根，不用 e.cwd：工作目錄會跟著 shell 的 cd 變，素材不能跟著跑
-    root = await projectRoot($, await $.session.root())
-    await $.command.register({ name: 'easel', description: '打開 easel：看圖、審稿與 Codex 額度' })
-    await Promise.all(TOOLS.map(tool => $.tool.register(tool)))
+    await runStartup($, 'register')
     const started = await next(e)
-    void (async () => {
-      home = await homeDir($)
-      await refreshAssets($)
-      await refreshSetup($)
-      await refreshUsage($)
-    })().catch(() => undefined)
-    $.clock.every(USAGE_EVERY_MS, () => {
-      refreshUsage($).catch(() => undefined)
-    })
+    void runStartup($, 'background')
     return started
   })
 
@@ -386,7 +447,8 @@ export const register: Register = on => {
       const last = latest(meta)
       return `${meta.asset}: ${meta.versions.length} 版，最新 v${last?.n ?? 0}（${last?.review ?? '無'}）`
     })
-    return { result: [usage ? `Codex 額度已用 ${usage.percent}%，${usage.reset} 重置。` : 'Codex 額度未知。', ...lines].join('\n') }
+    const broken = (await read($, startupAtom)).map(problem => `啟動時「${problem.label}」沒成功：${problem.message}`)
+    return { result: [usage ? `Codex 額度已用 ${usage.percent}%，${usage.reset} 重置。` : 'Codex 額度未知。', ...lines, ...broken].join('\n') }
   }).catch(() => ({ deny: 'easel 內部出錯，查不到狀態。' }))
 
   // Claude 自己叫 codex 生圖的話，easel 收不到圖也沒有檢查。其他 codex 用法不受影響。
@@ -400,13 +462,16 @@ export const register: Register = on => {
     const job = jobs[0]
     const waiting = assets.filter(meta => latest(meta)?.review === 'pending' && !jobs.some(j => j.asset === meta.asset))
     const first = waiting[0]
+    const broken = await read($, startupAtom)
     const line = job
       ? `正在畫 ${job.asset} v${job.version}`
-      : first
-        ? `${first.asset} v${latest(first)?.n} 等你審${waiting.length > 1 ? `（共 ${waiting.length} 個）` : ''}`
-        : usage && usage.tone !== 'none'
-          ? `Codex 額度已用 ${usage.percent}%`
-          : null
+      : broken[0]
+        ? `easel 啟動不完整：${broken[0].label}${broken.length > 1 ? ` 等 ${broken.length} 項` : ''}沒成功`
+        : first
+          ? `${first.asset} v${latest(first)?.n} 等你審${waiting.length > 1 ? `（共 ${waiting.length} 個）` : ''}`
+          : usage && usage.tone !== 'none'
+            ? `Codex 額度已用 ${usage.percent}%`
+            : null
     if (!line || e.props.hasSurvey) return next(e)
 
     const below = await next({ ...e, props: { ...e.props, maxRows: Math.max(0, e.props.maxRows - 1) } })
@@ -414,13 +479,14 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column">
         <Box flexDirection="row" gap={1} alignItems="center">
-          <Text color={job ? 'suggestion' : usage?.tone === 'warn' && waiting.length === 0 ? 'warning' : undefined}>{job ? '●' : waiting.length > 0 ? '▲' : '▲'}</Text>
+          <Text color={job ? 'suggestion' : broken.length > 0 || (usage?.tone === 'warn' && waiting.length === 0) ? 'warning' : undefined}>{job ? '●' : '▲'}</Text>
           <Text>{line}</Text>
           <Button
             key="band-open"
             label="打開"
             onPress={async () => {
-              if (!job && first) {
+              if (!job && broken.length > 0) await update($, viewAtom, (): EaselView => ({ kind: 'home' }))
+              else if (!job && first) {
                 const last = latest(first)
                 if (last) await update($, viewAtom, (): EaselView => ({ kind: 'detail', asset: first.asset, version: last.n }))
               }
@@ -464,6 +530,9 @@ export const register: Register = on => {
     )
     const go = (target: EaselView) => () => update($, viewAtom, () => target)
     const review = (asset: string, n: number, state: 'approved' | 'rejected') => () => changeVersion($, asset, n, { review: state })
+
+    /** 縮圖做不出來時寫在圖位上的話，跟著這台電腦做縮圖的方式走 */
+    const noThumb = thumbnailer((await read($, setupAtom)).platform ?? 'linux').failed
 
     const noticeCards = async (asset?: string): Promise<RenderElement[]> => {
       const list = await read($, noticesAtom)
@@ -511,10 +580,25 @@ export const register: Register = on => {
       )
     }
 
+    /** 啟動時沒成功的事。/easel 指令沒註冊成功時，這裡和對話框上方的那一列是僅有的入口。 */
+    const startupCards = async (): Promise<RenderElement[]> => {
+      const broken = await read($, startupAtom)
+      if (broken.length === 0) return []
+      return [
+        frame(
+          'startup',
+          'warning',
+          art('startup-art', alertCard({ tone: 'warn', title: 'easel 啟動不完整', detail: broken.map(problem => `${problem.label}：${problem.message}`).join('；') })),
+          <Text dimColor>排除後輸入 /reload-plugins，或開一個新對話。</Text>,
+        ),
+      ]
+    }
+
     const setupCards = async (): Promise<RenderElement[]> => {
       const setup = await read($, setupAtom)
       if (setup.state === 'ready' || setup.state === 'unknown') return []
       if (setup.state === 'missing') {
+        const { text, command } = codexInstall(setup.platform ?? 'linux')
         return [
           section(
             'setup',
@@ -522,11 +606,11 @@ export const register: Register = on => {
             frame(
               'setup-missing',
               'warning',
-              <Text>這台電腦找不到官方 Codex。請在終端機跑官方安裝指令：</Text>,
-              <Text>{CODEX_INSTALL_COMMAND}</Text>,
+              <Text>{`這台電腦找不到官方 Codex。${text}`}</Text>,
+              command ? <Text>{command}</Text> : null,
               row(
                 'setup-btns',
-                <Button key="copy-install" label="複製指令" onPress={() => $.ui.copy({ text: CODEX_INSTALL_COMMAND })} />,
+                command ? <Button key="copy-install" label="複製指令" onPress={() => $.ui.copy({ text: command })} /> : null,
                 <Button key="recheck" label="重新檢查" onPress={() => refreshSetup($)} />,
               ),
             ),
@@ -606,6 +690,7 @@ export const register: Register = on => {
           {art('hero', hero(usage))}
           {!Svg && usage ? <Text>{`額度已用 ${usage.percent}%，${usage.reset} 重置・今天 ${usage.today} 張`}</Text> : null}
           {usage?.tone === 'crit' ? frame('out', 'error', art('out-art', alertCard({ tone: 'crit', title: `額度用完了，${usage.reset} 才能再畫`, detail: `${usage.freeResets > 0 ? `你的帳號還有 ${usage.freeResets} 次免費重置。` : ''}現有素材照常能看與核准。` }))) : null}
+          {await startupCards()}
           {await setupCards()}
           {await noticeCards()}
           {pending.length > 0 ? section('pending', `等你審（${pending.length}）`, ...(await Promise.all(pending.map(card)))) : null}
@@ -650,7 +735,7 @@ export const register: Register = on => {
           {await noticeCards(asset)}
           {job ? await jobFrame(job) : null}
           {Svg ? (
-            art('big', bigPicture({ data: big, width: current.width, height: current.height, alpha: current.alpha, alt: `${asset} 第 ${n} 版。${current.prompt}` }))
+            art('big', bigPicture({ data: big, width: current.width, height: current.height, alpha: current.alpha, alt: `${asset} 第 ${n} 版。${current.prompt}`, missing: noThumb }))
           ) : 'Image' in table ? (
             <table.Image key="big-term" source={{ file, format: 'png' }} columns={40} rows={20} alt={`${asset} 第 ${n} 版`} />
           ) : (
@@ -735,7 +820,7 @@ export const register: Register = on => {
       return (
         <Box flexDirection="column" gap={2}>
           {row('head', <Button key="back" label="‹ 審稿" onPress={go({ kind: 'detail', asset, version: n })} />, <Text bold>{`v${left.n} 與 v${right.n}`}</Text>)}
-          {art('pair', compare({ left: { label: `v${left.n}`, badge: '上一版', data: a }, right: { label: `v${right.n}`, badge: '這一版', data: b }, ratio: right.height / Math.max(1, right.width), alpha: right.alpha }))}
+          {art('pair', compare({ left: { label: `v${left.n}`, badge: '上一版', data: a }, right: { label: `v${right.n}`, badge: '這一版', data: b }, ratio: right.height / Math.max(1, right.width), alpha: right.alpha, missing: noThumb }))}
           {section('why', '這一步改了什麼', frame('why-box', undefined, <Text>{`要求：${right.prompt}`}</Text>, right.selfNote ? <Text color={right.selfCheck === 'pass' ? 'success' : 'error'}>{`${right.selfCheck === 'pass' ? '✓' : '✗'} 自檢：${right.selfNote}`}</Text> : null))}
           {section(
             'keep',

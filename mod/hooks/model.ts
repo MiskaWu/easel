@@ -1,7 +1,7 @@
 // easel 的純函式：素材紀錄、提示詞、Codex 指令、事件解析、用量換算。不碰 $，可以單獨測。
 // 這裡的每條規則都來自 2026-11-06 的實測（數據在規格文件的「Phase 0 實測結果」），改之前先看那裡。
 
-import type { EaselMeta, EaselUsage, EaselVersion } from '../types'
+import type { EaselMeta, EaselPlatform, EaselUsage, EaselVersion } from '../types'
 
 /** 素材放在專案的這個資料夾底下，一個素材一個子資料夾。 */
 export const ROOT = 'art'
@@ -140,16 +140,13 @@ export function failureText(code: number | null, message: string | null): string
   return `Codex 異常結束（代碼 ${code ?? '無'}）。`
 }
 
-/** generated_images/<對話編號>/ 底下比生圖前多出來的最新一張：`<時間> <路徑>` 一行一筆。 */
-export function newestNewImage(listing: string, before: ReadonlySet<string>): string | null {
-  const rows = listing
-    .split('\n')
-    .map(line => {
-      const at = line.indexOf(' ')
-      return { time: Number(line.slice(0, at)), path: line.slice(at + 1) }
-    })
-    .filter(row => row.path.endsWith('.png') && !before.has(row.path))
-  return rows.reduce<{ time: number; path: string } | null>((best, row) => (best && best.time >= row.time ? best : row), null)?.path ?? null
+/** 一張圖檔：絕對路徑與修改時間（毫秒）。列檔的結果一律用這個形狀，不經過任何指令的文字輸出。 */
+export type ImageFile = { path: string; mtimeMs: number }
+
+/** generated_images/<對話編號>/ 底下比生圖前多出來的最新一張。算不算新只看路徑，時間只用來在多張新圖裡挑最新的。 */
+export function newestNewImage(files: readonly ImageFile[], before: ReadonlySet<string>): string | null {
+  const fresh = files.filter(file => file.path.endsWith('.png') && !before.has(file.path))
+  return fresh.reduce<ImageFile | null>((best, file) => (best && best.mtimeMs >= file.mtimeMs ? best : file), null)?.path ?? null
 }
 
 export type PngInfo = { width: number; height: number; alpha: boolean }
@@ -258,14 +255,6 @@ export function planName(plan: string): string {
   return `ChatGPT ${known[plan] ?? plan}`
 }
 
-/** `find -printf '%T@\n'` 的輸出換成毫秒。 */
-export function parseTimes(listing: string): number[] {
-  return listing
-    .split('\n')
-    .map(line => Number(line) * 1000)
-    .filter(t => Number.isFinite(t) && t > 0)
-}
-
 export function shortDate(ms: number): string {
   const d = new Date(ms)
   return `${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`
@@ -278,6 +267,93 @@ export function ago(ms: number, now: number): string {
   const hours = Math.floor(minutes / 60)
   if (hours < 24) return `${hours} 小時前`
   return shortDate(ms)
+}
+
+// ---- 平台 --------------------------------------------------------------------
+
+/** easel 跑得起來的三種環境。列檔走引擎的 $.fs 不分平台；會因平台而異的事都列在下面的 PLATFORMS 表。 */
+export type Platform = EaselPlatform
+
+/** 問這台電腦是哪一種：印出 uname，有 wslpath 再多印一行 wsl（WSL 的 uname 也是 Linux）。 */
+export const PLATFORM_PROBE = ['sh', '-c', 'uname -s; if command -v wslpath >/dev/null 2>&1; then echo wsl; fi']
+
+export function platformOf(probe: string): Platform {
+  const lines = probe.split('\n').map(line => line.trim())
+  if (lines[0] === 'Darwin') return 'macos'
+  return lines.includes('wsl') ? 'wsl' : 'linux'
+}
+
+/** 找不到 Codex 時教的裝法。command 有值才顯示成一行指令並給「複製指令」。 */
+export type CodexInstall = { text: string; command: string | null }
+
+/**
+ * 做面板縮圖的方式。桌面與手機只能把圖嵌進 Svg，所以要先縮小、轉成瀏覽器認得的格式。
+ * ext 是快取檔的副檔名，mime 是嵌進 Svg 時 data URI 的類型，兩個都要跟實際轉出來的格式一致。
+ */
+export type Thumbnailer = {
+  ext: string
+  mime: string
+  /** 把 file 縮到 width 寬、存成 out 的指令；quality 是 0–100 */
+  argv: (file: string, out: string, width: number, quality: number) => string[]
+  /** 做不出來時畫在圖位上的話 */
+  failed: string
+}
+
+type PlatformRow = {
+  /** 用預設程式開一個檔的指令 */
+  open: (file: string) => string[]
+  codexInstall: CodexInstall
+  thumbnail: Thumbnailer
+}
+
+const FFMPEG_WEBP: Thumbnailer = {
+  ext: 'webp',
+  mime: 'image/webp',
+  argv: (file, out, width, quality) => ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-i', file, '-vf', `scale=${width}:-2:flags=lanczos`, '-c:v', 'libwebp', '-q:v', String(quality), out],
+  failed: '縮圖做不出來，請確認有裝 ffmpeg',
+}
+
+// macOS 用系統內建的 sips，不必另外裝東西。它寫不出 WebP（實測 27.2 只能讀），所以轉 JPEG；
+// JPEG 沒有透明，透明的地方會變白底，面板上的棋盤格看不到，原圖不受影響。
+const SIPS_JPEG: Thumbnailer = {
+  ext: 'jpg',
+  mime: 'image/jpeg',
+  argv: (file, out, width, quality) => ['sips', '--resampleWidth', String(width), '-s', 'format', 'jpeg', '-s', 'formatOptions', String(quality), file, '--out', out],
+  failed: '縮圖做不出來（系統內建的 sips 沒有成功）',
+}
+
+const INSTALL_SCRIPT: CodexInstall = { text: '請在終端機跑官方安裝指令：', command: 'curl -fsSL https://chatgpt.com/codex/install.sh | sh' }
+
+// 會因平台而異的事都在這張表，一個平台一列；新平台或新差異加在這裡，不要到別處寫 if。
+// WSL 開檔要先把路徑換成 Windows 的寫法，explorer.exe 成功也回 1，所以後面補 true。
+// macOS 不教 curl | sh：那邊的人多半有自己管理工具的方式，照他的方式裝。
+const PLATFORMS: Record<Platform, PlatformRow> = {
+  macos: {
+    open: file => ['open', file],
+    codexInstall: { text: '請用你平常管理工具的方式安裝官方 Codex CLI，裝法見 https://github.com/openai/codex 。裝好後再試一次。', command: null },
+    thumbnail: SIPS_JPEG,
+  },
+  wsl: { open: file => ['sh', '-c', 'explorer.exe "$(wslpath -w "$1")"; true', 'sh', file], codexInstall: INSTALL_SCRIPT, thumbnail: FFMPEG_WEBP },
+  linux: { open: file => ['xdg-open', file], codexInstall: INSTALL_SCRIPT, thumbnail: FFMPEG_WEBP },
+}
+
+/** 用預設程式開一個檔的指令。 */
+export function openArgv(platform: Platform, file: string): string[] {
+  return PLATFORMS[platform].open(file)
+}
+
+export function thumbnailer(platform: Platform): Thumbnailer {
+  return PLATFORMS[platform].thumbnail
+}
+
+export function codexInstall(platform: Platform): CodexInstall {
+  return PLATFORMS[platform].codexInstall
+}
+
+/** 找不到 Codex 時回給 Claude 的一句話。 */
+export function codexMissingText(platform: Platform): string {
+  const { text, command } = codexInstall(platform)
+  return `這台電腦找不到官方 Codex。${text}${command ?? ''}`
 }
 
 // ---- 登入 --------------------------------------------------------------------

@@ -8,7 +8,7 @@
 - `mod/hooks/codex.ts`：碰外面世界的部分（跑 codex、收圖、縮圖、讀寫紀錄）。
 - `mod/hooks/visual.ts`：畫圖函式，純函式，給資料回 SVG。
 - `mod/hooks/register.tsx`：工具、面板、對話框上方的提醒。
-- `mod/skills/easel/SKILL.md`：教 Claude 怎麼用這些工具。
+- `mod/skills/draw/SKILL.md`：教 Claude 怎麼用這些工具（技能 `easel:draw`）。
 
 ## 不能動的規則
 
@@ -21,12 +21,31 @@
 - **成功看 `~/.codex/generated_images/<thread>/` 有沒有多新圖。** `exec --json` 的事件沒有生圖項目。
 - **用量查詢要撐住標準輸入。** app-server 一讀到 EOF 就結束，等不到回覆。
 
+## 平台
+
+Linux、WSL、macOS 都要能跑。macOS 的指令是 BSD 版，GNU 才有的寫法在那裡會直接報錯，而且測試用的替身不會報。
+
+- **列檔與讀修改時間只走 `$.fs.list`**（`codex.ts` 的 `listPngs`），不叫 `find`、`stat`、`ls`。原本用 `find -printf`，macOS 不認得，真的畫出來的圖會被報成「沒有新圖」。
+- **因平台而異的事放 `model.ts` 的 `PLATFORMS` 表**，一個平台一列，不在別處寫 `if`。目前有三件：用預設程式開檔、找不到 Codex 時教哪種裝法（macOS 不教 `curl | sh`）、怎麼做縮圖。
+- **macOS 的縮圖用內建的 `sips` 轉 JPEG，不依賴 ffmpeg。** `sips` 寫不出 WebP（27.2 實測只能讀）。副檔名、data URI 的類型、轉檔指令都在同一筆 `Thumbnailer`，要改就一起改；`visual.ts` 拿到的是完整的 data URI，不自己假設格式。JPEG 沒有透明，透明處是白底。
+- **其餘 shell 指令只用 GNU 與 BSD 都有的寫法**：`base64 | tr -d '\n'`（不用 `-w0`）、`head -c`、`env -u`、`find -maxdepth -mmin`。加新指令前先在 macOS 的 `/usr/bin` 版本試過。
+- **`timeout` 是例外**：macOS 27.2 實測有內建，沒有這個指令的舊版 macOS 不支援，README 有寫。
+
+## 啟動
+
+啟動時要做的事（註冊工具、註冊指令、找位置、讀狀態、輪詢）都列在 `register.tsx` 的 `STARTUP` 清單，一項一筆。
+
+- **各項互不牽連，失敗要看得到。** 一項失敗只回報那一項：寫一行到對話（`$.ui.log`），並記進 `startup` 狀態，顯示在對話框上方、面板首頁與 `status` 工具。不要回 `session.start` 手寫一串 `await`，也不要用 `.catch(() => undefined)` 吞掉。
+- **工具排在最前面。** 指令、面板、輪詢出問題時，Claude 仍然能畫。
+- **技能不能叫 `easel`（和 plugin 同名）。** 同名的技能會佔走 `/easel`，引擎就拒絕註冊面板指令（`"/easel" refused: it is the plugin's /easel:easel`）。0.1.1 因此整個啟動被跳過，工具全部不見。
+
 ## 引擎的限制
 
-- `$` 只能傳給**檔案頂層**的函式或自己模組匯入的函式，所以輔助函式都放模組層，不放在 `register` 裡。
-- 桌面和手機沒有 `Image`，圖只能嵌進 `Svg`，上限 131072 字元，所以先轉 WebP 縮圖。
+- `$` 只能傳給**檔案頂層**的函式或自己模組匯入的函式，所以輔助函式都放模組層，不放在 `register` 裡。匯入的要寫成 `function` 宣告，不能是箭頭函式；也不能交給存在清單或物件裡的函式（`step.run($)` 會讓模組載不起來），所以 `STARTUP` 只放資料，由 `runStep` 照 `kind` 呼叫。
+- 桌面和手機沒有 `Image`，圖只能嵌進 `Svg`，上限 131072 字元，所以先做縮圖（Linux 與 WSL 轉 WebP，macOS 轉 JPEG），太大再縮一級。
 - 手機沒有 `Input`、`Client`。
 - `claude plugin test` 裡 `process.spawn` 的替身要用 `async function*`，而且回傳 `{ value: { code, signal } }`。
+- 測試的替身站在引擎的位置，引擎自己會拒絕的事（指令撞名、政策擋工具）在測試裡不會發生，要讓替身回 `{ deny }` 才測得到。真引擎的行為用 `claude -p --plugin-dir mod --debug-file <檔>` 看 log。
 
 ## 測試
 

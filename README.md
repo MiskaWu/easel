@@ -46,21 +46,22 @@
 
 ## 安裝
 
-**支援 Linux 與 Windows 的 WSL。** macOS 和 Windows 原生目前跑不起來，因為 easel 用到 GNU 版的 `find`、`base64`、`timeout`。
+**支援 Linux、Windows 的 WSL 與 macOS。** Windows 原生目前跑不起來。
 
-### 1. 先準備兩個工具
+macOS 在 27.2 上驗證。easel 用系統內建的 `timeout` 限制單次生圖的等待時間，沒有這個指令的舊版 macOS 不支援（終端機打 `command -v timeout` 有結果就可以）。
 
-官方 [Codex CLI](https://github.com/openai/codex)：
+### 1. 先準備工具
+
+**Linux 與 WSL** 要兩個：官方 [Codex CLI](https://github.com/openai/codex)，以及用來產生面板縮圖的 `ffmpeg`（要有 libwebp 編碼器）。
 
 ```bash
 curl -fsSL https://chatgpt.com/codex/install.sh | sh
-```
-
-`ffmpeg`，用來產生面板的縮圖：
-
-```bash
 sudo apt install ffmpeg
 ```
+
+**macOS** 只要官方 Codex CLI。用你平常管理工具的方式裝，例如套件管理器，或你自己的 dotfiles、Ansible 這類設定；有哪些裝法見[官方說明](https://github.com/openai/codex#readme)。裝完確認 `codex --version` 跑得動。
+
+縮圖在 macOS 用系統內建的 `sips`，不必裝 ffmpeg。`sips` 寫不出 WebP，所以縮圖是 JPEG：透明背景的圖在面板縮圖上會是白底，存下來的原圖不受影響。
 
 Codex 登入不用現在做，第一次打開面板時會帶你用裝置碼登入，手機也能完成。要先到 ChatGPT 的安全性設定開啟裝置碼登入，否則頁面會顯示沒有開啟。
 
@@ -98,14 +99,15 @@ claude plugin marketplace update easel && claude plugin update easel@easel
 
 照下面做，不要改 `settings.json`，也不要替使用者登入 Codex。
 
-1. 確認是 Linux 或 WSL。macOS 或 Windows 原生就停下來，告訴使用者目前不支援。
+1. 確認是 Linux、WSL 或 macOS。Windows 原生就停下來，告訴使用者目前不支援。macOS 再跑 `command -v timeout`，沒有結果也停下來，告訴使用者這版 macOS 太舊。
 2. 決定用哪個 `claude`：`command -v claude` 有結果就用它；沒有的話用環境變數 `$CLAUDE_CODE_EXECPATH`
    （目前這個 Claude Code 本身，桌面 app 的 Code 分頁裡也有）。以下記作 `$CLAUDE`。
 3. 加入 marketplace：`"$CLAUDE" plugin marketplace add MiskaWu/easel`。
    已經加過的話改跑 `"$CLAUDE" plugin marketplace update easel`。
 4. 安裝：`"$CLAUDE" plugin install easel@easel`。已經裝過的話改跑 `"$CLAUDE" plugin update easel@easel`。
 5. 用 `"$CLAUDE" plugin list` 確認 `easel@easel` 是 enabled。
-6. 檢查 `codex --version` 和 `ffmpeg -version`，缺哪個就把「先準備兩個工具」那段的指令給使用者。
+6. 檢查 `codex --version`；Linux 與 WSL 再檢查 `ffmpeg -version`（macOS 不需要 ffmpeg）。缺哪個就把「先準備工具」那段對應系統的做法給使用者。
+   macOS 不要替使用者挑安裝方式，也不要直接幫他裝：問他平常怎麼管理工具，照他的方式來。
 7. 告訴使用者：先輸入 `/reload-plugins`（或開一個新對話），再輸入 `/easel` 打開面板並登入。
 
 ## 怎麼用
@@ -130,7 +132,7 @@ easel 只執行官方 `codex`，不讀 `~/.codex/auth.json`，也不自己呼叫
 
 ## 限制
 
-- 只支援 Linux 與 WSL。
+- 只支援 Linux、WSL 與 macOS（要有內建的 `timeout`，27.2 驗證過）。
 - 只能在 Claude Code 裡用，排程或純終端機叫不動。
 - 手機面板沒有輸入框，想修改請在對話裡說。
 - 官方的 `openai/codex-plugin-cc` 是程式碼審查與代辦用，跟 easel 可以並存。

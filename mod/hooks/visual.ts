@@ -129,17 +129,17 @@ export function tile(x: number, y: number, bg: string, icon: string, dot: string
 const easelIcon = (x: number, y: number, cls: string) =>
   `<path d="M${x + 10} ${y}v3M${x + 2} ${y + 20}l5-17h6l5 17M${x + 4.5} ${y + 13}h11" fill="none" class="${cls}" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><rect x="${x + 3}" y="${y + 3}" width="14" height="10" rx="1" fill="none" class="${cls}" stroke-width="1.7"/>`
 
-/** 圓角圖片。data 是 WebP 的 base64；透明圖底下鋪棋盤格，才看得出透明。 */
-function picture(x: number, y: number, w: number, h: number, data: string | null, r: number, alpha: boolean): string {
+/** 圓角圖片。data 是縮圖的 data URI（格式因平台而異，類型已經寫在裡面）；透明圖底下鋪棋盤格，才看得出透明。missing 是沒有縮圖時寫在圖位上的話。 */
+function picture(x: number, y: number, w: number, h: number, data: string | null, r: number, alpha: boolean, missing = '縮圖做不出來'): string {
   // 由位置決定，不用遞增的流水號：面板每次捲動都會重畫，字串一變圖就重新載入、高度塌掉，捲動位置會被打回去
   const id = `c${Math.round(x)}-${Math.round(y)}`
   if (!data) {
-    return `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="${r}" class="panel"/>` + (w > 120 ? txt(x + w / 2, y + h / 2, 't3', 12, '縮圖做不出來，請確認有裝 ffmpeg', 'text-anchor="middle"') : '')
+    return `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="${r}" class="panel"/>` + (w > 120 ? txt(x + w / 2, y + h / 2, 't3', 12, missing, 'text-anchor="middle"') : '')
   }
   const back = alpha
     ? `<pattern id="${id}p" width="16" height="16" patternUnits="userSpaceOnUse"><rect width="16" height="16" fill="#ffffff"/><rect width="8" height="8" fill="#cfcfca"/><rect x="8" y="8" width="8" height="8" fill="#cfcfca"/></pattern><rect x="${x}" y="${y}" width="${w}" height="${h}" fill="url(#${id}p)" clip-path="url(#${id})"/>`
     : ''
-  return `<clipPath id="${id}"><rect x="${x}" y="${y}" width="${w}" height="${h}" rx="${r}"/></clipPath>${back}<image href="data:image/webp;base64,${data}" x="${x}" y="${y}" width="${w}" height="${h}" preserveAspectRatio="xMidYMid ${alpha ? 'meet' : 'slice'}" clip-path="url(#${id})"/>`
+  return `<clipPath id="${id}"><rect x="${x}" y="${y}" width="${w}" height="${h}" rx="${r}"/></clipPath>${back}<image href="${data}" x="${x}" y="${y}" width="${w}" height="${h}" preserveAspectRatio="xMidYMid ${alpha ? 'meet' : 'slice'}" clip-path="url(#${id})"/>`
 }
 
 export type HeroData = { percent: number; pace: number; remaining: number | null; today: number; tone: 'none' | 'warn' | 'crit'; reset: string; plan: string } | null
@@ -214,9 +214,9 @@ export function jobCard(d: { title: string; sub: string; step: number }, w = 396
 }
 
 /** 審稿的大圖。圖的比例照實際尺寸。 */
-export function bigPicture(d: { data: string | null; width: number; height: number; alpha: boolean; alt: string }, w = 420): Drawing {
+export function bigPicture(d: { data: string | null; width: number; height: number; alpha: boolean; alt: string; missing?: string }, w = 420): Drawing {
   const h = Math.round(w * (d.height / Math.max(1, d.width)))
-  return { source: svg(w, h, picture(0, 0, w, h, d.data, 10, d.alpha)), alt: d.alt, height: h }
+  return { source: svg(w, h, picture(0, 0, w, h, d.data, 10, d.alpha, d.missing)), alt: d.alt, height: h }
 }
 
 /** 版本小圖：選中的外框強調，已核准的右下角打勾。圖本身不能按，切換靠下面的 Button。 */
@@ -255,12 +255,12 @@ export function versionInfo(d: { prompt: string; base: string; spec: string; che
 }
 
 /** 兩版並排。 */
-export function compare(d: { left: { label: string; badge: string; data: string | null }; right: { label: string; badge: string; data: string | null }; ratio: number; alpha: boolean }, w = 420): Drawing {
+export function compare(d: { left: { label: string; badge: string; data: string | null }; right: { label: string; badge: string; data: string | null }; ratio: number; alpha: boolean; missing?: string }, w = 420): Drawing {
   const gap = 8
   const cell = (w - gap) / 2
   const h = Math.round(cell * d.ratio)
   const side = (x: number, s: { label: string; badge: string; data: string | null }) =>
-    picture(x, 0, cell, h, s.data, 8, d.alpha) + txt(x, h + 18, 't1', 12.5, s.label, 'font-weight="700"') + pill(x + cell, h + 13, 'none', s.badge, 'end').svg
+    picture(x, 0, cell, h, s.data, 8, d.alpha, d.missing) + txt(x, h + 18, 't1', 12.5, s.label, 'font-weight="700"') + pill(x + cell, h + 13, 'none', s.badge, 'end').svg
   return { source: svg(w, h + 26, side(0, d.left) + side(cell + gap, d.right)), alt: `${d.left.label} 與 ${d.right.label} 並排比較。`, height: h + 26 }
 }
 

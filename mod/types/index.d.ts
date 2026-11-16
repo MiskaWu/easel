@@ -51,8 +51,11 @@ export type EaselUsage = {
   at: number
 }
 
-/** 這台電腦能不能用：還沒查、沒裝 Codex、沒登入、可以用 */
-export type EaselSetup = { state: 'unknown' | 'missing' | 'logged-out' | 'ready'; version: string }
+/** easel 跑得起來的三種環境 */
+export type EaselPlatform = 'macos' | 'wsl' | 'linux'
+
+/** 這台電腦能不能用：還沒查、沒裝 Codex、沒登入、可以用。platform 查過才有，決定教哪一種裝法、縮圖做不出來時怎麼說 */
+export type EaselSetup = { state: 'unknown' | 'missing' | 'logged-out' | 'ready'; version: string; platform?: EaselPlatform }
 
 export type EaselLogin = { state: 'idle' } | { state: 'starting' } | { state: 'waiting'; url: string; code: string; until: number } | { state: 'failed'; message: string }
 
@@ -66,6 +69,9 @@ export type EaselNotice = {
   retry: string
 }
 
+/** 啟動時沒成功的一項，顯示在對話框上方與面板，直到下次啟動 */
+export type EaselStartupProblem = { label: string; message: string }
+
 declare module 'claude-code' {
   interface PluginState {
     easel: {
@@ -77,6 +83,7 @@ declare module 'claude-code' {
       setup: EaselSetup
       login: EaselLogin
       notices: EaselNotice[]
+      startup: EaselStartupProblem[]
       tick: number
     }
   }

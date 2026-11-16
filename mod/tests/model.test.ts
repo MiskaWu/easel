@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { ago, failureText, isDirectImageCall, isValidName, latest, newArgv, newPrompt, newestNewImage, nextVersion, parseDeviceAuth, parseEvent, parseMeta, parsePng, parseTimes, parseUsage, patchVersion, reviseArgv, revisePrompt, splitLines, usageArgv, usageView } from '../hooks/model'
+import { ago, codexInstall, codexMissingText, failureText, isDirectImageCall, isValidName, latest, newArgv, newPrompt, newestNewImage, nextVersion, openArgv, parseDeviceAuth, parseEvent, parseMeta, parsePng, parseUsage, patchVersion, platformOf, reviseArgv, thumbnailer, revisePrompt, splitLines, usageArgv, usageView } from '../hooks/model'
 import type { EaselMeta, EaselUsage, EaselVersion } from '../types'
 
 const version = (n: number, over: Partial<EaselVersion> = {}): EaselVersion => ({
@@ -120,10 +120,15 @@ describe('解析', () => {
   })
 
   test('只認這次多出來的圖，而且取最新的：透明圖模型可能先生幾張不透明的', async () => {
-    const listing = '10.5 /g/old.png\n20.5 /g/a.png\n30.5 /g/b.png\n'
-    expect(newestNewImage(listing, new Set(['/g/old.png']))).toBe('/g/b.png')
-    expect(newestNewImage(listing, new Set(['/g/old.png', '/g/a.png', '/g/b.png']))).toBeNull()
-    expect(newestNewImage('', new Set())).toBeNull()
+    const files = [
+      { path: '/g/old.png', mtimeMs: 40_500 },
+      { path: '/g/b.png', mtimeMs: 30_500 },
+      { path: '/g/a.png', mtimeMs: 20_500 },
+      { path: '/g/b.txt', mtimeMs: 50_000 },
+    ]
+    expect(newestNewImage(files, new Set(['/g/old.png']))).toBe('/g/b.png')
+    expect(newestNewImage(files, new Set(['/g/old.png', '/g/a.png', '/g/b.png']))).toBeNull()
+    expect(newestNewImage([], new Set())).toBeNull()
   })
 
   test('從檔頭讀尺寸與透明通道', async () => {
@@ -187,13 +192,50 @@ describe('用量', () => {
     expect(Math.round(usageView(usage(3), [], NOW, startOfDay).pace)).toBe(3)
   })
 
-  test('find 的時間換成毫秒，空行略過', async () => {
-    expect(parseTimes('1.5\n\n2\n')).toEqual([1500, 2000])
-  })
-
   test('時間說法', async () => {
     expect(ago(NOW - 10_000, NOW)).toBe('剛剛')
     expect(ago(NOW - 180_000, NOW)).toBe('3 分鐘前')
     expect(ago(NOW - 7_200_000, NOW)).toBe('2 小時前')
+  })
+})
+
+describe('平台', () => {
+  test('uname 是 Darwin 就是 macOS；Linux 裡有 wslpath 才是 WSL', async () => {
+    expect(platformOf('Darwin\n')).toBe('macos')
+    expect(platformOf('Linux\n')).toBe('linux')
+    expect(platformOf('Linux\nwsl\n')).toBe('wsl')
+    expect(platformOf('')).toBe('linux')
+  })
+
+  test('開檔指令每個平台各一列：macOS 用 open，不能掉到 xdg-open', async () => {
+    expect(openArgv('macos', '/p/a b.png')).toEqual(['open', '/p/a b.png'])
+    expect(openArgv('linux', '/p/a.png')).toEqual(['xdg-open', '/p/a.png'])
+    expect(openArgv('wsl', '/p/a.png').join(' ')).toContain('explorer.exe "$(wslpath -w "$1")"')
+    expect(openArgv('wsl', '/p/a.png').at(-1)).toBe('/p/a.png')
+  })
+
+  test('縮圖：Linux 與 WSL 用 ffmpeg 轉 WebP，macOS 用內建的 sips 轉 JPEG；副檔名、類型、指令三者一致', async () => {
+    const mac = thumbnailer('macos')
+    expect([mac.ext, mac.mime]).toEqual(['jpg', 'image/jpeg'])
+    expect(mac.argv('/a/v1.png', '/a/.thumbs/v1-280.jpg', 280, 70)).toEqual(['sips', '--resampleWidth', '280', '-s', 'format', 'jpeg', '-s', 'formatOptions', '70', '/a/v1.png', '--out', '/a/.thumbs/v1-280.jpg'])
+    expect(mac.failed).not.toContain('ffmpeg')
+    for (const platform of ['linux', 'wsl'] as const) {
+      const maker = thumbnailer(platform)
+      expect([maker.ext, maker.mime]).toEqual(['webp', 'image/webp'])
+      const argv = maker.argv('/a/v1.png', '/a/.thumbs/v1-280.webp', 280, 70)
+      expect(argv[0]).toBe('ffmpeg')
+      expect(argv.join(' ')).toContain('scale=280:-2')
+      expect(argv.join(' ')).toContain('-c:v libwebp -q:v 70 /a/.thumbs/v1-280.webp')
+      expect(maker.failed).toContain('ffmpeg')
+    }
+  })
+
+  test('找不到 Codex 時教的裝法：Linux 與 WSL 給官方安裝指令，macOS 不教 curl | sh', async () => {
+    expect(codexInstall('linux').command).toContain('curl -fsSL https://chatgpt.com/codex/install.sh | sh')
+    expect(codexInstall('wsl').command).toBe(codexInstall('linux').command)
+    expect(codexInstall('macos').command).toBeNull()
+    expect(codexMissingText('macos')).not.toContain('curl')
+    expect(codexMissingText('macos')).toContain('管理工具的方式')
+    expect(codexMissingText('linux')).toBe('這台電腦找不到官方 Codex。請在終端機跑官方安裝指令：curl -fsSL https://chatgpt.com/codex/install.sh | sh')
   })
 })
