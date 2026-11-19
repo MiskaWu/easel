@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { REVISE_LIMIT, ago, autoStepText, autoStreak, clampLimit, codexInstall, codexMissingText, failureText, humanReviewed, isAutoBase, isDirectImageCall, isValidName, latest, limitReachedText, limitText, newArgv, newPrompt, newestNewImage, nextVersion, openArgv, parseDeviceAuth, parseEvent, parseMeta, parsePng, parseUsage, patchVersion, platformOf, resolveLimit, reviseArgv, reviseStep, storedLimitAfter, thumbnailer, revisePrompt, splitLines, uncheckedText, usageArgv, usageView, wasAuto } from '../hooks/model'
+import { LIST_PAGE, PENDING_CARDS, REVIEW_TEXT, REVISE_LIMIT, ago, autoStepText, autoStreak, clampLimit, codexInstall, codexMissingText, failureText, humanReviewed, isAutoBase, isDirectImageCall, isValidName, latest, limitReachedText, limitText, newArgv, newPrompt, newestNewImage, nextVersion, openArgv, parseDeviceAuth, parseEvent, parseMeta, parsePng, parseUsage, patchVersion, pageOf, pendingByRecency, platformOf, resolveLimit, reviseArgv, reviseStep, reviewCounts, splitPending, storedLimitAfter, thumbnailer, revisePrompt, splitLines, uncheckedText, usageArgv, usageView, wasAuto } from '../hooks/model'
 import type { EaselMeta, EaselUsage, EaselVersion } from '../types'
 
 const version = (n: number, over: Partial<EaselVersion> = {}): EaselVersion => ({
@@ -349,5 +349,44 @@ describe('平台', () => {
     expect(codexMissingText('macos')).not.toContain('curl')
     expect(codexMissingText('macos')).toContain('管理工具的方式')
     expect(codexMissingText('linux')).toBe('這台電腦找不到官方 Codex。請在終端機跑官方安裝指令：curl -fsSL https://chatgpt.com/codex/install.sh | sh')
+  })
+})
+
+describe('等你審的份量與收起來', () => {
+  const asset = (name: string, createdAt: number, review: EaselVersion['review'] = 'pending') => ({ ...meta([version(1, { createdAt, review })]), asset: name })
+
+  test('首頁只畫最新 5 張卡、清單一頁 8 列；常數寫在這裡，不散在面板裡', async () => {
+    expect(PENDING_CARDS).toBe(5)
+    expect(LIST_PAGE).toBe(8)
+  })
+
+  test('待審照最新一版的時間由新到舊；正在畫的、收起、核准、退回都不算', async () => {
+    const list = [asset('a', 1), asset('b', 3), asset('c', 2), asset('d', 9, 'shelved'), asset('e', 8, 'approved'), asset('f', 7, 'rejected'), asset('g', 6)]
+    expect(pendingByRecency(list, new Set(['g'])).map(m => m.asset)).toEqual(['b', 'c', 'a'])
+    expect(reviewCounts(list, new Set(['g']))).toEqual({ pending: 3, approved: 1, rejected: 1, shelved: 1 })
+  })
+
+  test('最新幾張畫成卡，其餘是較早的', async () => {
+    const list = Array.from({ length: 44 }, (_, i) => i)
+    const { cards, earlier } = splitPending(list)
+    expect(cards).toEqual([0, 1, 2, 3, 4])
+    expect(earlier.length).toBe(39)
+    expect(splitPending([1, 2]).earlier).toEqual([])
+  })
+
+  test('分頁：頁數超出就夾到最後一頁，清單變短也不會停在空白頁', async () => {
+    const list = Array.from({ length: 39 }, (_, i) => i)
+    expect(pageOf(list, 0)).toEqual({ items: [0, 1, 2, 3, 4, 5, 6, 7], page: 0, pages: 5 })
+    expect(pageOf(list, 4).items).toEqual([32, 33, 34, 35, 36, 37, 38])
+    expect(pageOf(list, 9).page).toBe(4)
+    expect(pageOf(list, -3).page).toBe(0)
+    expect(pageOf([], 2)).toEqual({ items: [], page: 0, pages: 1 })
+  })
+
+  test('「收起」是中性的：不算人審過，自檢不合格又收起來的版本，接著改照樣算自動修改', async () => {
+    expect(REVIEW_TEXT.shelved).toBe('收起')
+    expect(humanReviewed(version(1, { review: 'shelved' }))).toBe(false)
+    expect(isAutoBase(version(1, { selfCheck: 'fail', review: 'shelved' }))).toBe(true)
+    expect(reviseStep(meta([version(1, { review: 'shelved' })]), version(1, { review: 'shelved' }))).toEqual({ kind: 'unchecked' })
   })
 })

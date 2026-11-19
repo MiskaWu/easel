@@ -16,7 +16,8 @@ export type EaselVersion = {
   alpha: boolean
   selfCheck: 'pending' | 'pass' | 'fail'
   selfNote: string
-  review: 'pending' | 'approved' | 'rejected'
+  /** 人的處置。shelved＝「收起」：不核准也不退回，只是不列在「等你審」（0.1.5 起；舊的 meta.json 沒有這個值） */
+  review: 'pending' | 'approved' | 'rejected' | 'shelved'
   note: string
   /**
    * 這一版是自動修改畫出來的（接在自檢不合格、人還沒審過的版本後面 revise）。用來數連續自動修改了幾次。
@@ -61,6 +62,14 @@ export type EaselUsage = {
   at: number
 }
 
+/** 首頁的分頁與「全部收起來」的確認。confirm 記下按的那一刻要收哪幾版，確認時只收這些。 */
+export type EaselHome = {
+  earlierOpen: boolean
+  earlierPage: number
+  assetsPage: number
+  confirm: { asset: string; n: number }[] | null
+}
+
 /** easel 跑得起來的三種環境 */
 export type EaselPlatform = 'macos' | 'wsl' | 'linux'
 
@@ -97,6 +106,7 @@ declare module 'claude-code' {
       tick: number
       /** 面板上調的自動修改上限，$.store 裡那份的鏡像，給面板重畫用；null 是沒調過（用預設值） */
       reviseLimit: number | null
+      home: EaselHome
     }
   }
 }

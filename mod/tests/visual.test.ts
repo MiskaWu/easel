@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { assetCard, bigPicture, compare, jobCard, limitCard, versionThumb } from '../hooks/visual'
+import { assetCard, bigPicture, compare, jobCard, limitCard, moreCard, versionThumb } from '../hooks/visual'
 
 // 面板每次捲動都會重畫。圖的字串一變，圖片就重新載入、高度塌掉，捲動位置被打回頂端。
 test('同樣的資料畫兩次要一模一樣，連有裁切的圖都是', async () => {
@@ -52,4 +52,12 @@ test('沒有縮圖時圖位上的話由呼叫的人給，畫圖函式不自己�
   const blank = { data: null, width: 10, height: 10, alpha: false, alt: 'x' }
   expect(bigPicture(blank).source).not.toContain('ffmpeg')
   expect(bigPicture({ ...blank, missing: '縮圖做不出來（系統內建的 sips 沒有成功）' }).source).toContain('sips')
+})
+
+test('「另有 N 個較早的」不帶任何縮圖，說明寫在 alt 裡', async () => {
+  const card = moreCard({ title: '另有 39 個較早的待審', sub: '這裡只畫最新 5 張' })
+  expect(card.source).not.toContain('<image')
+  expect(card.source).toBe(moreCard({ title: '另有 39 個較早的待審', sub: '這裡只畫最新 5 張' }).source)
+  expect(card.alt).toBe('另有 39 個較早的待審。這裡只畫最新 5 張')
+  expect(card.source.length).toBeLessThan(5_000)
 })

@@ -6,12 +6,12 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderElement, Timer } from 'claude-code'
 
-import type { EaselJob, EaselLogin, EaselMeta, EaselNotice, EaselSetup, EaselStartupProblem, EaselUsage, EaselVersion, EaselView } from '../types'
+import type { EaselHome, EaselJob, EaselLogin, EaselMeta, EaselNotice, EaselSetup, EaselStartupProblem, EaselUsage, EaselVersion, EaselView } from '../types'
 import { assetDir, checkSetup, dropLock, draw, fetchImageTimes, fetchUsage, homeDir, loadAssets, loadMeta, openFile, projectRoot, saveMeta, takeLock, thumbnail } from './codex'
 import type { CodexStream } from './codex'
-import { LIMIT_SOURCE_TEXT, REVISE_LIMIT, ROOT, ago, autoStepText, autoStreak, codexArgv, codexInstall, codexMissingText, emptyMeta, findVersion, isDirectImageCall, isValidName, latest, limitReachedText, limitText, newArgv, newPrompt, nextVersion, parseDeviceAuth, patchVersion, planName, resolveLimit, reviseArgv, revisePrompt, reviseStep, storedLimitAfter, thumbnailer, uncheckedText, usageView } from './model'
+import { LIMIT_SOURCE_TEXT, PENDING_CARDS, REVIEW_TEXT, REVISE_LIMIT, ROOT, STATUS_PENDING_LINES, ago, autoStepText, autoStreak, codexArgv, codexInstall, codexMissingText, emptyMeta, findVersion, isDirectImageCall, isValidName, latest, limitReachedText, limitText, newArgv, newPrompt, nextVersion, pageOf, parseDeviceAuth, pendingByRecency, patchVersion, planName, resolveLimit, reviseArgv, revisePrompt, reviseStep, reviewCounts, splitPending, storedLimitAfter, thumbnailer, uncheckedText, usageView } from './model'
 import type { ReviseLimit, UsageView } from './model'
-import { STEPS, alertCard, assetCard, assetRow, bigPicture, compare, hero, jobCard, limitCard, loginCode, setupRow, versionInfo, versionThumb } from './visual'
+import { STEPS, alertCard, assetCard, assetRow, bigPicture, compare, hero, jobCard, limitCard, loginCode, moreCard, setupRow, versionInfo, versionThumb } from './visual'
 import type { Drawing } from './visual'
 
 type $ = EngineInterface
@@ -35,6 +35,9 @@ const tickAtom = atom({ plugin: 'easel', key: 'tick' } as const, 0)
 const limitAtom = atom({ plugin: 'easel', key: 'reviseLimit' } as const, null as number | null)
 /** $.store 裡存面板上限的鍵 */
 const LIMIT_KEY = 'reviseLimit'
+const HOME: EaselHome = { earlierOpen: false, earlierPage: 0, assetsPage: 0, confirm: null }
+/** 首頁的分頁與「全部收起來」的確認 */
+const homeAtom = atom({ plugin: 'easel', key: 'home' } as const, HOME)
 
 type NewInput = { asset?: string; prompt?: string; transparent?: boolean; refs?: string[] }
 type ReviseInput = { asset?: string; prompt?: string; base?: number; limit?: number }
@@ -372,6 +375,46 @@ async function askFromPanel($: $, asset: string, n: number, text: string): Promi
   await $.prompt.submit({ text, asUser: true })
 }
 
+// ---- 收起來 ------------------------------------------------------------------
+// 第三種處置：不核准也不退回，只是不列在「等你審」。只有面板的按鈕會呼叫，沒有工具能做，Claude 代按不了。
+
+/**
+ * 把這幾版收起來。只收「還是那個素材的最新一版、而且還是待審」的：按下確認前有新的一版、或已經被審過的，就不動它。
+ * 回實際收了幾個。
+ */
+async function shelveMany($: $, targets: readonly { asset: string; n: number }[]): Promise<number> {
+  let done = 0
+  for (const { asset, n } of targets) {
+    const meta = await loadMeta($, root, asset)
+    const last = meta && latest(meta)
+    if (!meta || !last || last.n !== n || last.review !== 'pending') continue
+    await saveMeta($, root, patchVersion(meta, n, { review: 'shelved' }))
+    done++
+  }
+  await refreshAssets($)
+  return done
+}
+
+/** 按下「全部收起來」：先算出要收哪幾版（卡片以外、較早的待審），記下來等確認，不直接收。 */
+async function askShelve($: $): Promise<void> {
+  const busy = new Set((await read($, jobsAtom)).map(job => job.asset))
+  const { earlier } = splitPending(pendingByRecency(await read($, assetsAtom), busy))
+  const targets = earlier.flatMap(meta => {
+    const last = latest(meta)
+    return last ? [{ asset: meta.asset, n: last.n }] : []
+  })
+  await update($, homeAtom, home => ({ ...home, confirm: targets.length > 0 ? targets : null }))
+}
+
+/** 「全部收起來」確認之後：收那幾個、關掉確認、收合較早的清單。 */
+async function confirmShelve($: $): Promise<void> {
+  const { confirm } = await read($, homeAtom)
+  if (!confirm) return
+  const done = await shelveMany($, confirm)
+  await update($, homeAtom, home => ({ ...home, confirm: null, earlierOpen: false, earlierPage: 0 }))
+  $.ui.toast(`已收起 ${done} 個，可以在「素材」裡找到`)
+}
+
 // ---- 登入 ------------------------------------------------------------------
 
 async function startLogin($: $): Promise<void> {
@@ -496,6 +539,8 @@ export const register: Register = on => {
     await refreshSetup($)
     refreshUsage($).catch(() => undefined)
     await update($, viewAtom, (): EaselView => ({ kind: 'home' }))
+    // 上次沒按完的「全部收起來」確認不留著：要收的那批是按下去那一刻算的，隔了一段時間就過期了
+    await update($, homeAtom, home => ({ ...home, confirm: null }))
     await $.ui.open(PANE_ARGS)
     return { text: 'easel 面板已開啟。' }
   })
@@ -532,17 +577,27 @@ export const register: Register = on => {
     const assets = await refreshAssets($)
     const usage = await currentUsage($)
     const cap = await readLimit($)
-    const lines = assets.map(meta => {
-      const last = latest(meta)
+    const jobs = await read($, jobsAtom)
+    const busy = new Set(jobs.map(job => job.asset))
+    const counts = reviewCounts(assets, busy)
+    // 只列待審（新到舊，最多 STATUS_PENDING_LINES 個）與正在畫的；收起、核准、退回只給總數，素材一多也不會洗版
+    const pending = pendingByRecency(assets, busy)
+    const selfText = { pass: '合格', fail: '不合格', pending: '還沒做' } as const
+    const pendingLines = pending.slice(0, STATUS_PENDING_LINES).map(meta => {
+      const last = latest(meta) as EaselVersion
       const streak = autoStreak(meta)
-      return `${meta.asset}: ${meta.versions.length} 版，最新 v${last?.n ?? 0}（${last?.review ?? '無'}）${streak > 0 ? `，已連續自動修改 ${streak} 次` : ''}`
+      return `- ${meta.asset}：最新 v${last.n}（共 ${meta.versions.length} 版），自檢${selfText[last.selfCheck]}${streak > 0 ? `，已連續自動修改 ${streak} 次` : ''}`
     })
+    const more = pending.length - pendingLines.length
     const broken = (await read($, startupAtom)).map(problem => `啟動時「${problem.label}」沒成功：${problem.message}`)
     return {
       result: [
         usage ? `Codex 額度已用 ${usage.percent}%，${usage.reset} 重置。` : 'Codex 額度未知。',
         `自動修改上限：${limitText(cap.limit)}（${LIMIT_SOURCE_TEXT[cap.source]}，可在 /easel 面板調）。`,
-        ...lines,
+        `素材 ${assets.length} 個：待審 ${counts.pending}、收起 ${counts.shelved}、已核准 ${counts.approved}、退回 ${counts.rejected}、正在畫 ${jobs.length}。`,
+        ...(pendingLines.length > 0 ? ['待審（新到舊）：', ...pendingLines] : []),
+        ...(more > 0 ? [`…另有 ${more} 個較早的待審。要清版面的話，請使用者在 /easel 面板按「全部收起來」（收起不算核准也不算退回）。`] : []),
+        ...(jobs.length > 0 ? ['正在畫：', ...jobs.map(job => `- ${job.asset} v${job.version}`)] : []),
         ...broken,
       ].join('\n'),
     }
@@ -627,7 +682,8 @@ export const register: Register = on => {
       </Box>
     )
     const go = (target: EaselView) => () => update($, viewAtom, () => target)
-    const review = (asset: string, n: number, state: 'approved' | 'rejected') => () => changeVersion($, asset, n, { review: state })
+    // 核准、退回、收起來都只在這裡（面板的按鈕）寫，沒有工具能寫，Claude 代按不了
+    const review = (asset: string, n: number, state: 'approved' | 'rejected' | 'shelved') => () => changeVersion($, asset, n, { review: state })
 
     /** 縮圖做不出來時寫在圖位上的話，跟著這台電腦做縮圖的方式走 */
     const noThumb = thumbnailer((await read($, setupAtom)).platform ?? 'linux').failed
@@ -776,18 +832,36 @@ export const register: Register = on => {
       )
     }
 
+    /** 分頁列：一頁放得下就不畫。上一頁、下一頁只在有得翻時出現。 */
+    const pager = (key: string, at: { page: number; pages: number }, turn: (page: number) => () => Promise<unknown>): RenderElement | null =>
+      at.pages > 1
+        ? row(
+            key,
+            at.page > 0 ? <Button key={`${key}-prev`} label="‹ 上一頁" onPress={turn(at.page - 1)} /> : null,
+            <Text dimColor>{`第 ${at.page + 1}／${at.pages} 頁`}</Text>,
+            at.page < at.pages - 1 ? <Button key={`${key}-next`} label="下一頁 ›" onPress={turn(at.page + 1)} /> : null,
+          )
+        : null
+
     const homePage = async (): Promise<RenderElement> => {
       const assets = (await read($, assetsAtom)).slice().sort((a, b) => (latest(b)?.createdAt ?? 0) - (latest(a)?.createdAt ?? 0))
       const jobs = await read($, jobsAtom)
       const usage = await currentUsage($)
       const busy = new Set(jobs.map(job => job.asset))
-      const pending = assets.filter(meta => latest(meta)?.review === 'pending' && !busy.has(meta.asset))
+      const pending = pendingByRecency(assets, busy)
       const others = assets.filter(meta => !pending.includes(meta))
       const now = await $.clock.now()
+      const home = await read($, homeAtom)
+      // 份量有上限：卡片只畫最新幾張，較早的與素材清單都只畫一頁；沒畫的不做縮圖
+      const { cards, earlier } = splitPending(pending)
+      const earlierPage = pageOf(earlier, home.earlierPage)
+      const assetsPage = pageOf(others, home.assetsPage)
+      const setHome = (patch: Partial<EaselHome>) => () => update($, homeAtom, current => ({ ...current, ...patch }))
 
       const card = async (meta: EaselMeta): Promise<RenderElement> => {
         const last = latest(meta) as EaselVersion
-        const data = await thumbnail($, path(meta.asset), `v${last.n}`, 160)
+        // 終端機沒有 Svg，縮圖做了也畫不出來
+        const data = Svg ? await thumbnail($, path(meta.asset), `v${last.n}`, 160) : null
         const note = last.selfCheck === 'pending' ? undefined : `${last.selfCheck === 'pass' ? '✓' : '✗'} 自檢：${last.selfNote}`
         return frame(
           `pending-${meta.asset}`,
@@ -797,6 +871,7 @@ export const register: Register = on => {
             `pending-btn-${meta.asset}`,
             <Button key={`open-${meta.asset}`} label="打開審稿" variant="primary" onPress={go({ kind: 'detail', asset: meta.asset, version: last.n })} />,
             <Button key={`quick-${meta.asset}`} label="直接核准" onPress={review(meta.asset, last.n, 'approved')} />,
+            <Button key={`shelve-${meta.asset}`} label="收起來" onPress={review(meta.asset, last.n, 'shelved')} />,
           ),
         )
       }
@@ -804,13 +879,56 @@ export const register: Register = on => {
       const listRow = async (meta: EaselMeta): Promise<RenderElement | null> => {
         const last = latest(meta)
         if (!last) return null
-        const data = await thumbnail($, path(meta.asset), `v${last.n}`, 96)
-        const badge = last.review === 'approved' ? { tone: 'ok', text: '已核准' } : last.review === 'rejected' ? { tone: 'none', text: '退回' } : { tone: 'warn', text: '待審' }
+        const data = Svg ? await thumbnail($, path(meta.asset), `v${last.n}`, 96) : null
+        const badge = { tone: last.review === 'approved' ? 'ok' : last.review === 'pending' ? 'warn' : 'none', text: REVIEW_TEXT[last.review] }
         return row(
           `row-${meta.asset}`,
           art(`row-art-${meta.asset}`, assetRow({ name: meta.asset, sub: `v${last.n}・${ago(last.createdAt, now)}${meta.transparent ? '・透明' : ''}`, badge, thumb: data, alpha: last.alpha })),
           <Button key={`row-open-${meta.asset}`} label="打開" onPress={go({ kind: 'detail', asset: meta.asset, version: last.n })} />,
         )
+      }
+
+      /** 「另有 N 個較早的待審」：預設收著（不做任何縮圖）；展開後分頁畫成清單列，不畫大卡。 */
+      const earlierCards = async (): Promise<RenderElement[]> => {
+        if (earlier.length === 0) return []
+        const title = `另有 ${earlier.length} 個較早的待審`
+        const sub = `這裡只畫最新 ${PENDING_CARDS} 張；收起來的會移到下方「素材」`
+        const list = home.earlierOpen ? ((await Promise.all(earlierPage.items.map(listRow))).filter(Boolean) as RenderElement[]) : []
+        return [
+          frame(
+            'earlier',
+            undefined,
+            Svg ? art('earlier-art', moreCard({ title, sub })) : <Text>{`${title}（${sub}）`}</Text>,
+            row(
+              'earlier-btns',
+              <Button key="earlier-toggle" label={home.earlierOpen ? '收合' : '展開'} onPress={setHome({ earlierOpen: !home.earlierOpen, earlierPage: 0 })} />,
+              home.confirm ? null : <Button key="shelve-earlier" label="全部收起來" onPress={() => askShelve($)} />,
+            ),
+            ...list,
+            home.earlierOpen ? pager('earlier-pager', earlierPage, page => setHome({ earlierPage: page })) : null,
+          ),
+          ...(home.confirm
+            ? [
+                frame(
+                  'shelve-confirm',
+                  'warning',
+                  art(
+                    'shelve-confirm-art',
+                    alertCard({
+                      tone: 'warn',
+                      title: `要把 ${home.confirm.length} 個較早的待審收起來嗎？`,
+                      detail: '不算核准也不算退回，只是不列在「等你審」。它們會移到下方「素材」，打開後照樣能核准或退回；之後有新的一版，新版會回到「等你審」。',
+                    }),
+                  ),
+                  row(
+                    'shelve-confirm-btns',
+                    <Button key="shelve-earlier-confirm" label={`收起 ${home.confirm.length} 個`} variant="primary" onPress={() => confirmShelve($)} />,
+                    <Button key="shelve-earlier-cancel" label="取消" onPress={setHome({ confirm: null })} />,
+                  ),
+                ),
+              ]
+            : []),
+        ]
       }
 
       const empty = assets.length === 0 && jobs.length === 0
@@ -819,13 +937,20 @@ export const register: Register = on => {
           {art('hero', hero(usage))}
           {!Svg && usage ? <Text>{`額度已用 ${usage.percent}%，${usage.reset} 重置・今天 ${usage.today} 張`}</Text> : null}
           {usage?.tone === 'crit' ? frame('out', 'error', art('out-art', alertCard({ tone: 'crit', title: `額度用完了，${usage.reset} 才能再畫`, detail: `${usage.freeResets > 0 ? `你的帳號還有 ${usage.freeResets} 次免費重置。` : ''}現有素材照常能看與核准。` }))) : null}
+          {/* 固定排在額度後面：下面的清單再長都擠不到它 */}
+          {await limitSection()}
           {await startupCards()}
           {await setupCards()}
           {await noticeCards()}
-          {await limitSection()}
-          {pending.length > 0 ? section('pending', `等你審（${pending.length}）`, ...(await Promise.all(pending.map(card)))) : null}
+          {pending.length > 0 ? section('pending', `等你審（${pending.length}）`, ...(await Promise.all(cards.map(card))), ...(await earlierCards())) : null}
           {jobs.length > 0 ? section('jobs', `正在畫（${jobs.length}）`, ...(await Promise.all(jobs.map(jobFrame)))) : null}
-          {others.length > 0 ? section('assets', `素材（${others.length}）`, frame('assets-box', undefined, ...((await Promise.all(others.map(listRow))).filter(Boolean) as RenderElement[]))) : null}
+          {others.length > 0
+            ? section(
+                'assets',
+                `素材（${others.length}）`,
+                frame('assets-box', undefined, ...((await Promise.all(assetsPage.items.map(listRow))).filter(Boolean) as RenderElement[]), pager('assets-pager', assetsPage, page => setHome({ assetsPage: page }))),
+              )
+            : null}
           {empty ? <Text dimColor>還沒有素材。在對話裡說「幫我畫…」就會開新素材。</Text> : <Text dimColor>在對話裡說「幫我畫…」就會開新素材。</Text>}
         </Box>
       )
@@ -849,9 +974,9 @@ export const register: Register = on => {
       const file = `${dir}/${current.file}`
       const jobs = await read($, jobsAtom)
       const job = jobs.find(one => one.asset === asset)
-      const big = await thumbnail($, dir, `v${n}`, 840)
-      const strip = await Promise.all(sorted.map(async v => ({ n: v.n, data: await thumbnail($, dir, `v${v.n}`, 128), selected: v.n === n, approved: v.review === 'approved', alpha: v.alpha })))
-      const badge = current.review === 'approved' ? '已核准' : current.review === 'rejected' ? '退回' : '待審'
+      const big = Svg ? await thumbnail($, dir, `v${n}`, 840) : null
+      const strip = await Promise.all(sorted.map(async v => ({ n: v.n, data: Svg ? await thumbnail($, dir, `v${v.n}`, 128) : null, selected: v.n === n, approved: v.review === 'approved', alpha: v.alpha })))
+      const badge = REVIEW_TEXT[current.review]
       const check = current.selfCheck === 'pending' ? null : { tone: current.selfCheck === 'pass' ? 'ok' : 'crit', text: `${current.selfCheck === 'pass' ? '✓' : '✗'} 自檢：${current.selfNote}` }
 
       return (
@@ -897,17 +1022,20 @@ export const register: Register = on => {
               ),
             ),
           )}
-          {current.review === 'pending'
+          {current.review === 'pending' || current.review === 'shelved'
             ? section(
                 'review',
                 '審稿',
                 frame(
                   'review-box',
-                  'warning',
+                  current.review === 'pending' ? 'warning' : undefined,
+                  // 收起來的照樣能核准或退回；「收起來」本身只對待審的有
+                  current.review === 'shelved' ? <Text dimColor>這一版已收起來，不列在「等你審」。核准、退回或修改都照常可以。</Text> : null,
                   row(
                     'review-btns',
                     <Button key="approve" label={`核准 v${n}`} variant="primary" onPress={review(asset, n, 'approved')} />,
                     <Button key="reject" label="退回" onPress={review(asset, n, 'rejected')} />,
+                    current.review === 'pending' ? <Button key="shelve" label="收起來" onPress={review(asset, n, 'shelved')} /> : null,
                   ),
                   Input ? (
                     <Input
@@ -946,7 +1074,7 @@ export const register: Register = on => {
       const left = sorted[sorted.findIndex(v => v.n === n) - 1]
       if (!meta || !right || !left) return missing('沒有可以比較的上一版。')
       const dir = path(asset)
-      const [a, b] = await Promise.all([thumbnail($, dir, `v${left.n}`, 420), thumbnail($, dir, `v${right.n}`, 420)])
+      const [a, b] = Svg ? await Promise.all([thumbnail($, dir, `v${left.n}`, 420), thumbnail($, dir, `v${right.n}`, 420)]) : [null, null]
       return (
         <Box flexDirection="column" gap={2}>
           {row('head', <Button key="back" label="‹ 審稿" onPress={go({ kind: 'detail', asset, version: n })} />, <Text bold>{`v${left.n} 與 v${right.n}`}</Text>)}

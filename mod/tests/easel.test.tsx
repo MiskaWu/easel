@@ -782,7 +782,7 @@ test('舊的 meta.json 沒有 auto 欄位：照常讀得到、面板畫得出來
   const w = world(on, { metas: [old], images: [DRAWN] })
   await start($)
   expect(refused(await revise($))).toContain('已經連續自動修改 2 次')
-  expect(await status($)).toContain('fox: 3 版，最新 v3（pending），已連續自動修改 2 次')
+  expect(await status($)).toContain('- fox：最新 v3（共 3 版），自檢不合格，已連續自動修改 2 次')
   await openPane($)
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect(await seen(ui, /fox/)).toBe(true)
@@ -989,4 +989,173 @@ test('面板比較頁「改用上一版當底再畫」：一樣記下人審過�
   expect(typeof savedMeta(w.files).versions[0]?.askedAt).toBe('number')
   expect(savedMeta(w.files).versions[1]?.askedAt).toBeUndefined()
   expect(served(await revise($, { base: 1 }))).toContain('v3.png')
+})
+
+// ---- 等你審的份量有上限，加上中性的「收起來」 ------------------------------------------
+// 起因：負責人的專案有 44 個從沒審過的素材，首頁原本替每一個都畫一張帶 160 縮圖的卡：
+// 46 張 Svg、約 45 萬字元，重新載入後第一次打開要跑 88 次外部程式做縮圖。現在只畫最新 5 張，其餘收成一列。
+
+/** count 個待審素材，asset-00 最舊、編號越大越新 */
+const many = (count: number, over: Partial<EaselVersion> = {}) =>
+  Array.from({ length: count }, (_, i) => meta(`asset-${String(i).padStart(2, '0')}`, [version(1, { createdAt: 1_000 + i, ...UNCHECKED, ...over })]))
+/** 做了哪些寬度的縮圖（Linux 用 ffmpeg） */
+const thumbWidths = (runs: string[][]) => runs.filter(argv => argv[0] === 'ffmpeg').map(argv => Number(/scale=(\d+):/.exec(argv.join(' '))?.[1]))
+type Found = { type: string; key: string | undefined; props: Record<string, unknown> }
+const keysOf = async (ui: { findAll: (q: { type?: string }) => Promise<unknown[]> }, prefix: string) =>
+  ((await ui.findAll({ type: 'Button' })) as Found[]).map(el => el.key ?? '').filter(key => key.startsWith(prefix))
+const metaOf = (files: Record<string, string>, asset: string) => JSON.parse(files[`${CWD}/art/${asset}/meta.json`] ?? '{}') as EaselMeta
+
+for (const surface of ['desktop', 'mobile', 'terminal'] as const) {
+  test(`44 個待審（${surface}）：只畫最新 5 張卡，其餘收成一列；沒畫的不做縮圖；上限那一列排在待審前面`, async ($, on) => {
+    const w = world(on, { metas: many(44) })
+    await start($)
+    await openPane($)
+    const before = w.runs.length
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await keysOf(ui, 'open-asset-')).toEqual(['open-asset-43', 'open-asset-42', 'open-asset-41', 'open-asset-40', 'open-asset-39'])
+    expect(await seen(ui, /等你審（44）/)).toBe(true)
+    expect(await seen(ui, /另有 39 個較早的待審/)).toBe(true)
+    expect(await ui.find({ key: 'earlier-toggle' })).toBeDefined()
+    expect(await ui.find({ key: 'shelve-earlier' })).toBeDefined()
+    // 縮圖只替畫出來的 5 張卡做；終端機沒有 Svg，一張都不做
+    expect(thumbWidths(w.runs.slice(before))).toEqual(surface === 'terminal' ? [] : [160, 160, 160, 160, 160])
+    expect(await seen(ui, /自動修改上限/)).toBe(true)
+    if (surface !== 'terminal') {
+      const svgs = (await ui.findAll({ type: 'Svg' })).map(el => ({ alt: String(el.props.alt ?? ''), size: String(el.props.source ?? '').length }))
+      expect(svgs.length).toBe(8) // 頁首、上限、5 張卡、「另有」那一列
+      expect(svgs.some(svg => svg.size > 131_072)).toBe(false)
+      const limitAt = svgs.findIndex(svg => svg.alt.startsWith('自動修改上限'))
+      const firstCard = svgs.findIndex(svg => svg.alt.startsWith('asset-'))
+      expect(limitAt).toBeGreaterThan(-1)
+      expect(limitAt).toBeLessThan(firstCard)
+    }
+    await ui.unmount()
+  })
+}
+
+test('展開較早的：分頁畫成清單列（小縮圖），一頁 8 列，只替這一頁做縮圖；可以翻頁、收合', async ($, on) => {
+  const w = world(on, { metas: many(44) })
+  await start($)
+  await openPane($)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  let before = w.runs.length
+  await ui.press({ key: 'earlier-toggle' })
+  expect(await keysOf(ui, 'row-open-')).toEqual(['row-open-asset-38', 'row-open-asset-37', 'row-open-asset-36', 'row-open-asset-35', 'row-open-asset-34', 'row-open-asset-33', 'row-open-asset-32', 'row-open-asset-31'])
+  expect(thumbWidths(w.runs.slice(before))).toEqual([96, 96, 96, 96, 96, 96, 96, 96])
+  expect(await seen(ui, /第 1／5 頁/)).toBe(true)
+  expect(await ui.find({ key: 'earlier-pager-prev' })).toBeUndefined()
+
+  before = w.runs.length
+  await ui.press({ key: 'earlier-pager-next' })
+  expect((await keysOf(ui, 'row-open-'))[0]).toBe('row-open-asset-30')
+  expect(thumbWidths(w.runs.slice(before)).length).toBe(8)
+  for (let i = 0; i < 3; i++) await ui.press({ key: 'earlier-pager-next' })
+  expect(await keysOf(ui, 'row-open-')).toEqual(['row-open-asset-06', 'row-open-asset-05', 'row-open-asset-04', 'row-open-asset-03', 'row-open-asset-02', 'row-open-asset-01', 'row-open-asset-00'])
+  expect(await ui.find({ key: 'earlier-pager-next' })).toBeUndefined()
+
+  await ui.press({ key: 'earlier-toggle' })
+  expect(await keysOf(ui, 'row-open-')).toEqual([])
+  await ui.unmount()
+})
+
+for (const surface of ['desktop', 'mobile'] as const) {
+  test(`單張收起來（${surface}）：卡片離開「等你審」，移到素材標「收起」；打開後照樣能核准，沒有再收一次的鈕`, async ($, on) => {
+    const w = world(on, { metas: many(6) })
+    await start($)
+    await openPane($)
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'shelve-asset-05' })
+    expect(metaOf(w.files, 'asset-05').versions[0]?.review).toBe('shelved')
+    expect(await seen(ui, /等你審（5）/)).toBe(true)
+    expect(await keysOf(ui, 'open-asset-')).toEqual(['open-asset-04', 'open-asset-03', 'open-asset-02', 'open-asset-01', 'open-asset-00'])
+    expect(await ui.find({ key: 'earlier-toggle' })).toBeUndefined()
+    expect(await seen(ui, /素材（1）/)).toBe(true)
+    expect(await seen(ui, /asset-05（收起）/)).toBe(true)
+
+    await ui.press({ key: 'row-open-asset-05' })
+    expect(await seen(ui, /v1・收起/)).toBe(true)
+    expect(await ui.find({ key: 'shelve' })).toBeUndefined()
+    await ui.press({ key: 'approve' })
+    expect(metaOf(w.files, 'asset-05').versions[0]?.review).toBe('approved')
+    await ui.unmount()
+  })
+
+  test(`全部收起來（${surface}）：先確認並顯示會收幾個；取消不收；確認只收較早的那幾個，最新 5 張留著`, async ($, on) => {
+    const w = world(on, { metas: many(44) })
+    await start($)
+    await openPane($)
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'shelve-earlier' })
+    expect(await seen(ui, /要把 39 個較早的待審收起來嗎/)).toBe(true)
+    expect(((await ui.find({ key: 'shelve-earlier-confirm' })) as Found | undefined)?.props.label).toBe('收起 39 個')
+    expect(Object.values(w.files).some(text => text.includes('"shelved"'))).toBe(false)
+
+    await ui.press({ key: 'shelve-earlier-cancel' })
+    expect(await ui.find({ key: 'shelve-earlier-confirm' })).toBeUndefined()
+    expect(Object.values(w.files).some(text => text.includes('"shelved"'))).toBe(false)
+
+    await ui.press({ key: 'shelve-earlier' })
+    await ui.press({ key: 'shelve-earlier-confirm' })
+    const reviews = many(44).map(m => metaOf(w.files, m.asset).versions[0]?.review)
+    expect(reviews.slice(0, 39).every(r => r === 'shelved')).toBe(true)
+    expect(reviews.slice(39).every(r => r === 'pending')).toBe(true)
+    expect(await seen(ui, /等你審（5）/)).toBe(true)
+    expect(await ui.find({ key: 'earlier-toggle' })).toBeUndefined()
+    expect(await seen(ui, /素材（39）/)).toBe(true)
+    // 素材清單也分頁：39 個只畫一頁 8 列
+    expect((await keysOf(ui, 'row-open-')).length).toBe(8)
+    await ui.unmount()
+    expect(await status($)).toContain('素材 44 個：待審 5、收起 39、已核准 0、退回 0、正在畫 0。')
+  })
+}
+
+test('確認前就有新的一版、或已經被審過的，「全部收起來」不動它', async ($, on) => {
+  const w = world(on, { metas: many(7) })
+  await start($)
+  await openPane($)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'shelve-earlier' })
+  expect(await seen(ui, /要把 2 個較早的待審收起來嗎/)).toBe(true)
+  // 確認之前，asset-00 被人從別處核准了
+  const approved = metaOf(w.files, 'asset-00')
+  w.files[`${CWD}/art/asset-00/meta.json`] = JSON.stringify({ ...approved, versions: approved.versions.map(v => ({ ...v, review: 'approved' })) })
+  await ui.press({ key: 'shelve-earlier-confirm' })
+  expect(metaOf(w.files, 'asset-00').versions[0]?.review).toBe('approved')
+  expect(metaOf(w.files, 'asset-01').versions[0]?.review).toBe('shelved')
+  await ui.unmount()
+})
+
+test('收起來之後有新的一版：新版照常回到「等你審」', async ($, on) => {
+  const w = world(on, { metas: [meta('fox', [version(1, { review: 'shelved', selfCheck: 'pass' })])], images: [DRAWN] })
+  await start($)
+  expect(await status($)).toContain('待審 0、收起 1')
+  expect(served(await revise($))).toContain('v2.png')
+  expect(metaOf(w.files, 'fox').versions.map(v => v.review)).toEqual(['shelved', 'pending'])
+  expect(await status($)).toContain('待審 1、收起 0')
+  await openPane($)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await keysOf(ui, 'open-fox')).toEqual(['open-fox'])
+  await ui.unmount()
+})
+
+test('status：收起與待審分開計數，只列待審（新到舊，最多 10 個）與正在畫的，其餘只給總數', async ($, on) => {
+  const metas = [...many(14), meta('shelved-a', [version(1, { review: 'shelved' })]), meta('shelved-b', [version(1, { review: 'shelved' })]), meta('done', [version(1, { review: 'approved' })])]
+  world(on, { metas })
+  await start($)
+  const text = await status($)
+  expect(text).toContain('素材 17 個：待審 14、收起 2、已核准 1、退回 0、正在畫 0。')
+  const lines = text.split('\n')
+  const first = lines.indexOf('待審（新到舊）：')
+  expect(lines.slice(first + 1, first + 11).map(line => line.split('：')[0])).toEqual(['- asset-13', '- asset-12', '- asset-11', '- asset-10', '- asset-09', '- asset-08', '- asset-07', '- asset-06', '- asset-05', '- asset-04'])
+  expect(lines[first + 1]).toBe('- asset-13：最新 v1（共 1 版），自檢還沒做')
+  expect(text).toContain('…另有 4 個較早的待審')
+  expect(text).toContain('全部收起來')
+  expect(text).not.toContain('shelved-a')
+  expect(text).not.toContain('done：')
+})
+
+test('收起來、核准、退回都只有面板的按鈕做得到：沒有給 Claude 用的工具', async ($, on) => {
+  const w = world(on)
+  await start($)
+  expect(w.tools.slice().sort()).toEqual(ALL_TOOLS)
 })

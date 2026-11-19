@@ -282,6 +282,20 @@ export function alertCard(d: { tone: 'warn' | 'crit'; title: string; detail?: st
   return { source: svg(w, h, body), alt: `${d.title}。${d.detail ?? ''}`, height: h }
 }
 
+/**
+ * 「另有 N 個較早的待審」：疊起來的三張卡＋標題＋一句說明。不帶縮圖：較早的那些展開後才分頁畫，收著時一張縮圖都不做。
+ * 高度和素材清單的一列一樣（46），左緣和卡片的縮圖對齊。
+ */
+export function moreCard(d: { title: string; sub: string }, w = 396): Drawing {
+  const h = 46
+  const stack =
+    `<rect x="12" y="3" width="30" height="30" rx="6" class="panel"/>` +
+    `<rect x="6" y="8" width="30" height="30" rx="6" class="panel"/><rect x="6" y="8" width="30" height="30" rx="6" fill="none" class="hair" stroke-width="1.2"/>` +
+    `<rect x="0" y="13" width="30" height="30" rx="6" class="warnK"/><rect x="0" y="13" width="30" height="30" rx="6" fill="none" class="warnS" stroke-width="1.4"/>`
+  const body = stack + txt(56, 19, 't1', 14, fit(d.title, 14, w - 56), 'font-weight="600"') + txt(56, 37, 't3', 12, fit(d.sub, 12, w - 56))
+  return { source: svg(w, h, body), alt: `${d.title}。${d.sub}`, height: h }
+}
+
 export type LimitCardData = {
   /** 現在的上限 */
   value: number

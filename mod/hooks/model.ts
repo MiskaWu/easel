@@ -38,6 +38,57 @@ export function patchVersion(meta: EaselMeta, n: number, patch: Partial<EaselVer
   return { ...meta, versions: meta.versions.map(v => (v.n === n ? { ...v, ...patch } : v)) }
 }
 
+// ---- 審稿狀態與首頁的份量 --------------------------------------------------------
+//
+// 素材的狀態看最新一版的 review：待審、已核准、退回，以及中性的「收起」（不核准也不退回，只是不列在「等你審」）。
+// 收起來的素材有新的一版時，新版照常是待審，所以收起只對那一版有效，不用另外記。
+//
+// 首頁的份量要有上限：原本每個待審素材都畫一張帶 160 縮圖的卡，44 個待審時整頁約 45 萬字元、46 張 Svg，
+// 重新載入後第一次打開要跑 88 次外部程式做縮圖（實測，見 CLAUDE.md）。現在卡片、清單都只畫一頁，沒畫的不做縮圖。
+
+export type Review = EaselVersion['review']
+
+export const REVIEW_TEXT: Record<Review, string> = { pending: '待審', approved: '已核准', rejected: '退回', shelved: '收起' }
+
+/** 「等你審」最多畫幾張帶大縮圖的卡（最新的幾張），其餘收成一列「另有 N 個較早的」。 */
+export const PENDING_CARDS = 5
+/** 清單一頁幾列：展開的較早待審、素材清單都照這個分頁。 */
+export const LIST_PAGE = 8
+/** status 最多列幾個待審，其餘給總數。 */
+export const STATUS_PENDING_LINES = 10
+
+/** 素材現在的狀態：最新一版的 review。沒有版本的素材回 null。 */
+export function reviewOf(meta: EaselMeta): Review | null {
+  return latest(meta)?.review ?? null
+}
+
+/** 等你審的素材，新到舊（看最新一版的時間）。正在畫的不算：它們列在「正在畫」。面板、status、「全部收起來」都用這一份。 */
+export function pendingByRecency(metas: readonly EaselMeta[], busy: ReadonlySet<string>): EaselMeta[] {
+  return metas.filter(meta => reviewOf(meta) === 'pending' && !busy.has(meta.asset)).sort((a, b) => (latest(b)?.createdAt ?? 0) - (latest(a)?.createdAt ?? 0))
+}
+
+/** 最新的幾張畫成卡，其餘是較早的。list 要先照新到舊排好。 */
+export function splitPending<T>(list: readonly T[], cards = PENDING_CARDS): { cards: T[]; earlier: T[] } {
+  return { cards: list.slice(0, cards), earlier: list.slice(cards) }
+}
+
+/** 取第 page 頁（從 0 起）。頁數超出就夾到最後一頁：收起或核准讓清單變短時，不會停在空白頁。 */
+export function pageOf<T>(list: readonly T[], page: number, size = LIST_PAGE): { items: T[]; page: number; pages: number } {
+  const pages = Math.max(1, Math.ceil(list.length / size))
+  const at = Math.min(Math.max(0, Math.floor(page) || 0), pages - 1)
+  return { items: list.slice(at * size, (at + 1) * size), page: at, pages }
+}
+
+/** 照最新一版的狀態數素材；正在畫的另外數（busy），不算進待審。 */
+export function reviewCounts(metas: readonly EaselMeta[], busy: ReadonlySet<string>): Record<Review, number> {
+  const counts: Record<Review, number> = { pending: 0, approved: 0, rejected: 0, shelved: 0 }
+  for (const meta of metas) {
+    const review = reviewOf(meta)
+    if (review && !(review === 'pending' && busy.has(meta.asset))) counts[review]++
+  }
+  return counts
+}
+
 // ---- 自動修改的上限 ----------------------------------------------------------
 //
 // 自檢不合格時 Claude 會自己 revise 重畫。這裡決定「最多連續幾次」，程式真的會數，到了就拒絕、不啟動 codex。
@@ -83,9 +134,10 @@ export function limitText(limit: number): string {
 /**
  * 人審過這一版：在面板核准、退回過，或在面板上對它提了修改要求（askedAt）。
  * 這三件都只有面板的按鈕與輸入框寫得到，工具寫不到，所以 Claude 沒辦法替人「審過」。
+ * 「收起來」（shelved）不算：那是為了清版面，不是對圖的判斷，「全部收起來」一次就收幾十個。
  */
 export function humanReviewed(v: EaselVersion): boolean {
-  return v.review !== 'pending' || typeof v.askedAt === 'number'
+  return v.review === 'approved' || v.review === 'rejected' || typeof v.askedAt === 'number'
 }
 
 /** 人已經接手的版本：自檢合格，或人審過。連續自動修改數到這裡就停。 */
