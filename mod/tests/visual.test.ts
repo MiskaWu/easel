@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { assetCard, bigPicture, compare, jobCard, versionThumb } from '../hooks/visual'
+import { assetCard, bigPicture, compare, jobCard, limitCard, versionThumb } from '../hooks/visual'
 
 // 面板每次捲動都會重畫。圖的字串一變，圖片就重新載入、高度塌掉，捲動位置被打回頂端。
 test('同樣的資料畫兩次要一模一樣，連有裁切的圖都是', async () => {
@@ -35,6 +35,17 @@ test('縮圖的 data URI 原樣放進圖裡：格式因平台而異，畫圖函�
   expect(jpeg).not.toContain('image/webp')
   const webp = bigPicture({ data: 'data:image/webp;base64,QUJD', width: 10, height: 10, alpha: false, alt: 'x' }).source
   expect(webp).toContain('href="data:image/webp;base64,QUJD"')
+})
+
+test('自動修改上限：亮幾格就是上限幾次，格數是可調的最大值；說明寫在 alt 裡，讀不到圖的介面也知道', async () => {
+  const card = (value: number) => limitCard({ value, max: 10, title: value === 0 ? '不自動修改' : `最多 ${value} 次`, sub: '說明', badge: { tone: 'none', text: '預設' } })
+  const lit = (source: string) => [...source.matchAll(/<rect [^>]*height="5"[^>]*class="(a|panel)"/g)].map(m => m[1])
+  expect(lit(card(3).source)).toEqual(['a', 'a', 'a', 'panel', 'panel', 'panel', 'panel', 'panel', 'panel', 'panel'])
+  expect(lit(card(0).source).every(cls => cls === 'panel')).toBe(true)
+  expect(lit(card(10).source).every(cls => cls === 'a')).toBe(true)
+  expect(card(3).source).toBe(card(3).source)
+  expect(card(3).alt).toBe('自動修改上限：最多 3 次（預設）。說明。可調 0 到 10 次。')
+  expect(card(3).animated).toBeUndefined()
 })
 
 test('沒有縮圖時圖位上的話由呼叫的人給，畫圖函式不自己提 ffmpeg', async () => {

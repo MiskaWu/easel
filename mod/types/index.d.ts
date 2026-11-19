@@ -18,6 +18,16 @@ export type EaselVersion = {
   selfNote: string
   review: 'pending' | 'approved' | 'rejected'
   note: string
+  /**
+   * 這一版是自動修改畫出來的（接在自檢不合格、人還沒審過的版本後面 revise）。用來數連續自動修改了幾次。
+   * 0.1.4 起才記；更舊的 meta.json 沒有這個欄位，照它的底圖推回來（model.ts 的 wasAuto）。
+   */
+  auto?: boolean
+  /**
+   * 人在面板上對這一版提修改要求的時間（審稿頁的「想改什麼？」、比較頁的「改用這版當底再畫」）。
+   * 只有面板寫，算「人審過」：以它為底的 revise 不必先自檢，也不算自動修改。0.1.4 起才有。
+   */
+  askedAt?: number
 }
 
 export type EaselMeta = {
@@ -85,6 +95,8 @@ declare module 'claude-code' {
       notices: EaselNotice[]
       startup: EaselStartupProblem[]
       tick: number
+      /** 面板上調的自動修改上限，$.store 裡那份的鏡像，給面板重畫用；null 是沒調過（用預設值） */
+      reviseLimit: number | null
     }
   }
 }

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { ago, codexInstall, codexMissingText, failureText, isDirectImageCall, isValidName, latest, newArgv, newPrompt, newestNewImage, nextVersion, openArgv, parseDeviceAuth, parseEvent, parseMeta, parsePng, parseUsage, patchVersion, platformOf, reviseArgv, thumbnailer, revisePrompt, splitLines, usageArgv, usageView } from '../hooks/model'
+import { REVISE_LIMIT, ago, autoStepText, autoStreak, clampLimit, codexInstall, codexMissingText, failureText, humanReviewed, isAutoBase, isDirectImageCall, isValidName, latest, limitReachedText, limitText, newArgv, newPrompt, newestNewImage, nextVersion, openArgv, parseDeviceAuth, parseEvent, parseMeta, parsePng, parseUsage, patchVersion, platformOf, resolveLimit, reviseArgv, reviseStep, storedLimitAfter, thumbnailer, revisePrompt, splitLines, uncheckedText, usageArgv, usageView, wasAuto } from '../hooks/model'
 import type { EaselMeta, EaselUsage, EaselVersion } from '../types'
 
 const version = (n: number, over: Partial<EaselVersion> = {}): EaselVersion => ({
@@ -48,6 +48,118 @@ describe('素材紀錄', () => {
     expect(parseMeta('{oops')).toBeNull()
     expect(parseMeta('{"asset":1}')).toBeNull()
     expect(parseMeta(JSON.stringify(meta([])))?.asset).toBe('fox')
+  })
+})
+
+describe('自動修改的上限', () => {
+  test('預設 2 次、可調 0 到 10：已安裝的人不改設定，行為和以前一樣', async () => {
+    expect(REVISE_LIMIT).toEqual({ default: 2, min: 0, max: 10 })
+  })
+
+  test('超出範圍就夾住，小數四捨五入，不是數字就當沒給', async () => {
+    expect(clampLimit(3)).toBe(3)
+    expect(clampLimit(-1)).toBe(0)
+    expect(clampLimit(99)).toBe(10)
+    expect(clampLimit(2.6)).toBe(3)
+    expect(clampLimit(0)).toBe(0)
+    expect(clampLimit('5')).toBeNull()
+    expect(clampLimit(Number.NaN)).toBeNull()
+    expect(clampLimit(Number.POSITIVE_INFINITY)).toBeNull()
+    expect(clampLimit(undefined)).toBeNull()
+    expect(clampLimit(null)).toBeNull()
+  })
+
+  test('三層：當次指定蓋過面板，面板蓋過預設；壞掉的值往下一層找', async () => {
+    expect(resolveLimit(undefined)).toEqual({ limit: 2, source: 'default' })
+    expect(resolveLimit(5)).toEqual({ limit: 5, source: 'panel' })
+    expect(resolveLimit(5, 7)).toEqual({ limit: 7, source: 'call' })
+    expect(resolveLimit(undefined, 0)).toEqual({ limit: 0, source: 'call' })
+    expect(resolveLimit(5, 99)).toEqual({ limit: 10, source: 'call' })
+    expect(resolveLimit(0)).toEqual({ limit: 0, source: 'panel' })
+    expect(resolveLimit('壞掉', undefined)).toEqual({ limit: 2, source: 'default' })
+    expect(resolveLimit(4, '三')).toEqual({ limit: 4, source: 'panel' })
+  })
+
+  test('面板的增減夾在範圍內；調回預設值就不存，來源回到「預設」', async () => {
+    expect(storedLimitAfter(2, 1)).toBe(3)
+    expect(storedLimitAfter(3, -1)).toBeNull()
+    expect(storedLimitAfter(10, 1)).toBe(10)
+    expect(storedLimitAfter(0, -1)).toBe(0)
+    expect(storedLimitAfter(1, -1)).toBe(0)
+  })
+
+  test('0 寫成「不自動修改」', async () => {
+    expect(limitText(0)).toBe('不自動修改')
+    expect(limitText(3)).toBe('最多 3 次')
+  })
+
+  const fail = { selfCheck: 'fail' as const }
+  const pass = { selfCheck: 'pass' as const }
+
+  test('只有接在「不合格、人還沒審」的版本後面才算自動修改；人在面板提過修改也算審過', async () => {
+    expect(isAutoBase(version(1, fail))).toBe(true)
+    expect(isAutoBase(version(1, pass))).toBe(false)
+    expect(isAutoBase(version(1))).toBe(false)
+    expect(isAutoBase(version(1, { ...fail, review: 'rejected' }))).toBe(false)
+    expect(isAutoBase(version(1, { ...fail, askedAt: 5 }))).toBe(false)
+    expect(humanReviewed(version(1))).toBe(false)
+    expect(humanReviewed(version(1, { review: 'approved' }))).toBe(true)
+    expect(humanReviewed(version(1, { askedAt: 5 }))).toBe(true)
+  })
+
+  test('連續次數：從最新往回數自動修改的版本，數到第一版或人接手的版本為止', async () => {
+    const run = meta([version(1, fail), version(2, { ...fail, base: 1, auto: true }), version(3, { ...fail, base: 2, auto: true })])
+    expect(autoStreak(run)).toBe(2)
+    expect(reviseStep(run, version(3, fail))).toEqual({ kind: 'auto', k: 3 })
+    // 指定 base 回到更早的不合格版本，次數不會歸零
+    expect(reviseStep(run, version(1, fail))).toEqual({ kind: 'auto', k: 3 })
+    // 中間有一版合格：從它之後重新數
+    const passed = meta([version(1, fail), version(2, { ...fail, base: 1, auto: true }), version(3, { ...pass, base: 2, auto: true })])
+    expect(autoStreak(passed)).toBe(0)
+    expect(reviseStep(passed, version(2, { ...fail, base: 1, auto: true }))).toEqual({ kind: 'auto', k: 1 })
+    // 使用者自己要求的修改（auto: false）也是分界
+    const asked = meta([version(1, fail), version(2, { ...fail, base: 1, auto: true }), version(3, { ...fail, base: 2, auto: false })])
+    expect(autoStreak(asked)).toBe(0)
+    // 人在面板退回過：人已經接手
+    const reviewed = meta([version(1, fail), version(2, { ...fail, base: 1, auto: true, review: 'rejected' })])
+    expect(autoStreak(reviewed)).toBe(0)
+    expect(reviseStep(reviewed, reviewed.versions[1] as EaselVersion)).toEqual({ kind: 'manual' })
+  })
+
+  test('底圖只有三種：合格或人審過＝使用者要求的修改；不合格且沒人審＝自動修改；還沒自檢也沒人審＝先自檢', async () => {
+    const run = meta([version(1, fail), version(2, { ...pass, base: 1, auto: true })])
+    expect(reviseStep(run, version(2, pass))).toEqual({ kind: 'manual' })
+    expect(reviseStep(meta([version(1)]), version(1))).toEqual({ kind: 'unchecked' })
+    // 人在面板退回、核准，或對它提了修改：沒自檢也可以改，而且不算自動修改
+    expect(reviseStep(meta([version(1, { review: 'rejected' })]), version(1, { review: 'rejected' }))).toEqual({ kind: 'manual' })
+    expect(reviseStep(meta([version(1, { askedAt: 5 })]), version(1, { askedAt: 5 }))).toEqual({ kind: 'manual' })
+    expect(reviseStep(meta([version(1, { ...fail, askedAt: 5 })]), version(1, { ...fail, askedAt: 5 }))).toEqual({ kind: 'manual' })
+    const text = uncheckedText('fox', 3)
+    expect(text).toContain('v3 還沒自檢')
+    expect(text).toContain('Read')
+    expect(text).toContain('self_check')
+  })
+
+  test('舊的 meta.json 沒記 auto：看底圖現在是不是不合格、沒人審', async () => {
+    const old = meta([version(1, fail), version(2, { ...fail, base: 1 }), version(3, { ...fail, base: 2 })])
+    expect(wasAuto(old, version(1, fail))).toBe(false)
+    expect(wasAuto(old, version(2, { ...fail, base: 1 }))).toBe(true)
+    expect(autoStreak(old)).toBe(2)
+    // 底圖合格、或底圖已經不在了，都不算
+    expect(wasAuto(meta([version(1, pass), version(2, { base: 1 })]), version(2, { base: 1 }))).toBe(false)
+    expect(wasAuto(meta([version(2, { base: 1 })]), version(2, { base: 1 }))).toBe(false)
+    // 讀得進來：parseMeta 不因為少了欄位就丟掉素材
+    expect(parseMeta(JSON.stringify(old))?.versions.length).toBe(3)
+  })
+
+  test('到上限的話要講清楚：連續幾次、上限幾次、哪一層定的、怎麼繼續', async () => {
+    const text = limitReachedText('fox', 2, { limit: 2, source: 'default' })
+    expect(text).toContain('連續自動修改 2 次')
+    expect(text).toContain('上限是 2 次（預設）')
+    expect(text).toContain('limit')
+    expect(text).toContain('/easel 面板')
+    expect(limitReachedText('fox', 0, { limit: 0, source: 'panel' })).toContain('上限是 0（你在面板調的，不自動修改）')
+    expect(autoStepText(1, { limit: 4, source: 'call' })).toBe('這是連續第 1 次自動修改，上限 4 次（這次指定）。')
   })
 })
 

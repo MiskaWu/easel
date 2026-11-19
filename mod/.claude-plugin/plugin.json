@@ -1,6 +1,6 @@
 {
   "name": "easel",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "engines": { "claude-code": ">=2.1.326" },
   "author": { "name": "MiskaWu", "url": "https://github.com/MiskaWu" },
   "types": "./types/index.d.ts",

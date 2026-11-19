@@ -9,9 +9,9 @@ import type { EngineInterface, Register, RenderElement, Timer } from 'claude-cod
 import type { EaselJob, EaselLogin, EaselMeta, EaselNotice, EaselSetup, EaselStartupProblem, EaselUsage, EaselVersion, EaselView } from '../types'
 import { assetDir, checkSetup, dropLock, draw, fetchImageTimes, fetchUsage, homeDir, loadAssets, loadMeta, openFile, projectRoot, saveMeta, takeLock, thumbnail } from './codex'
 import type { CodexStream } from './codex'
-import { ROOT, ago, codexArgv, codexInstall, codexMissingText, emptyMeta, findVersion, isDirectImageCall, isValidName, latest, newArgv, newPrompt, nextVersion, parseDeviceAuth, patchVersion, planName, reviseArgv, revisePrompt, thumbnailer, usageView } from './model'
-import type { UsageView } from './model'
-import { STEPS, alertCard, assetCard, assetRow, bigPicture, compare, hero, jobCard, loginCode, setupRow, versionInfo, versionThumb } from './visual'
+import { LIMIT_SOURCE_TEXT, REVISE_LIMIT, ROOT, ago, autoStepText, autoStreak, codexArgv, codexInstall, codexMissingText, emptyMeta, findVersion, isDirectImageCall, isValidName, latest, limitReachedText, limitText, newArgv, newPrompt, nextVersion, parseDeviceAuth, patchVersion, planName, resolveLimit, reviseArgv, revisePrompt, reviseStep, storedLimitAfter, thumbnailer, uncheckedText, usageView } from './model'
+import type { ReviseLimit, UsageView } from './model'
+import { STEPS, alertCard, assetCard, assetRow, bigPicture, compare, hero, jobCard, limitCard, loginCode, setupRow, versionInfo, versionThumb } from './visual'
 import type { Drawing } from './visual'
 
 type $ = EngineInterface
@@ -31,9 +31,13 @@ const loginAtom = atom({ plugin: 'easel', key: 'login' } as const, { state: 'idl
 const noticesAtom = atom({ plugin: 'easel', key: 'notices' } as const, [] as EaselNotice[])
 const startupAtom = atom({ plugin: 'easel', key: 'startup' } as const, [] as EaselStartupProblem[])
 const tickAtom = atom({ plugin: 'easel', key: 'tick' } as const, 0)
+/** 面板上調的自動修改上限。真正的值在 $.store（跨對話），這裡是給面板重畫用的鏡像，只由 storeLimit 寫。 */
+const limitAtom = atom({ plugin: 'easel', key: 'reviseLimit' } as const, null as number | null)
+/** $.store 裡存面板上限的鍵 */
+const LIMIT_KEY = 'reviseLimit'
 
 type NewInput = { asset?: string; prompt?: string; transparent?: boolean; refs?: string[] }
-type ReviseInput = { asset?: string; prompt?: string; base?: number }
+type ReviseInput = { asset?: string; prompt?: string; base?: number; limit?: number }
 type CheckInput = { asset?: string; version?: number; pass?: boolean; note?: string }
 
 const TOOLS = [
@@ -59,13 +63,22 @@ const TOOLS = [
     isDeferred: false,
     description:
       '修改既有素材，畫下一版。會接回畫底圖的那段 Codex 對話，並自動附上底圖。提示詞要寫明「保留什麼、改什麼」。' +
-      '預設以最新版為底；要回到舊版改時才指定 base。自檢不合格時自動修改最多 2 次，之後交給人判斷。',
+      '預設以最新版為底；要回到舊版改時才指定 base。' +
+      '底圖那一版要先有自檢結果：還沒自檢（人也還沒在面板審過）就會拒絕，先用 Read 看圖、用 self_check 記錄，再決定要不要改。' +
+      `接在自檢不合格的版本後面的修改算自動修改，easel 會數連續幾次：上限預設 ${REVISE_LIMIT.default} 次，使用者可以在 /easel 面板調。` +
+      '到上限時這個工具會拒絕、不畫，這時停下來把各版的自檢結果交給使用者判斷。現在的上限用 status 查，每次自動修改的結果也會寫是第幾次。',
     inputSchema: {
       type: 'object',
       properties: {
         asset: { type: 'string', description: '素材名' },
         prompt: { type: 'string', description: '修改要求' },
         base: { type: 'number', description: '以第幾版為底，預設最新版' },
+        limit: {
+          type: 'integer',
+          description:
+            `這次的自動修改上限（${REVISE_LIMIT.min} 到 ${REVISE_LIMIT.max}，超出會夾住，0 是不自動修改）。` +
+            '只有使用者在對話裡說了這次可以改幾次才帶，這一輪接下來的 revise 都帶同一個數字；使用者沒說就不要帶，也不要自己加大。',
+        },
       },
       required: ['asset', 'prompt'],
     },
@@ -134,6 +147,31 @@ async function currentUsage($: $): Promise<(UsageView & { plan: string; freeRese
   return { ...usageView(usage, await read($, timesAtom), now, day.getTime()), plan: planName(usage.plan), freeResets: usage.freeResets }
 }
 
+// ---- 自動修改的上限 ------------------------------------------------------------
+// 唯一的來源是 $.store 的 reviseLimit：revise 的判斷、status、面板都經過 readLimit 讀它，按鈕經過 storeLimit 寫它。
+
+/** 現在的上限。requested 是這次 revise 帶的 limit；順手把 $.store 的值同步到面板的鏡像（別的對話可能調過）。 */
+async function readLimit($: $, requested?: unknown): Promise<ReviseLimit> {
+  const stored = await $.store.get(LIMIT_KEY)
+  const panel = resolveLimit(stored)
+  const mirror = panel.source === 'panel' ? panel.limit : null
+  if ((await read($, limitAtom)) !== mirror) await update($, limitAtom, () => mirror)
+  return resolveLimit(stored, requested)
+}
+
+/** 存面板上調的值；null 是恢復預設。立刻生效：下一次 revise、status 讀到的就是它，面板跟著重畫。 */
+async function storeLimit($: $, value: number | null): Promise<void> {
+  if (value === null) await $.store.delete(LIMIT_KEY)
+  else await $.store.set(LIMIT_KEY, value)
+  await update($, limitAtom, () => value)
+}
+
+/** 面板的增加、減少：從 $.store 現在的值算，不從畫面上的數字算。 */
+async function stepLimit($: $, delta: number): Promise<void> {
+  const { limit } = await readLimit($)
+  await storeLimit($, storedLimitAfter(limit, delta))
+}
+
 // ---- 生圖 ------------------------------------------------------------------
 
 function startTick($: $): void {
@@ -165,9 +203,11 @@ async function clearNotice($: $, asset: string): Promise<void> {
   await update($, noticesAtom, list => list.filter(n => n.asset !== asset))
 }
 
+const NOT_LOCATED = 'easel 啟動時沒找到專案或家目錄的位置，這次不能畫。請對方輸入 /reload-plugins 再試，並看 /easel 面板上的啟動訊息。'
+
 async function ready($: $): Promise<string | null> {
   // 啟動時沒找到這兩個位置就不能畫：素材會寫錯地方，畫好的圖也收不回來
-  if (!root || !home) return 'easel 啟動時沒找到專案或家目錄的位置，這次不能畫。請對方輸入 /reload-plugins 再試，並看 /easel 面板上的啟動訊息。'
+  if (!root || !home) return NOT_LOCATED
   const setup = await refreshSetup($)
   if (setup.state === 'missing') return codexMissingText(setup.platform ?? 'linux')
   if (setup.state === 'logged-out') return 'Codex 還沒登入。請對方打開 /easel 面板完成登入。'
@@ -183,11 +223,15 @@ type Job = {
   argv: string[]
   refs: string[]
   retry: string
+  /** 這次是自動修改（記進這一版的 auto，下次數連續次數用） */
+  auto: boolean
+  /** 畫好時補在結果後面的話，例如「這是連續第 1 次自動修改，上限 2 次」；沒有就是空字串 */
+  note: string
 }
 
 /** 新圖與修改共用的流程：上鎖、跑 Codex、驗圖、寫紀錄。回給 Claude 的是一段話，失敗就拒絕這次呼叫。 */
 async function runJob($: $, job: Job): Promise<{ result: string } | { deny: string }> {
-  const { meta, version, base, prompt, input, argv, refs, retry } = job
+  const { meta, version, base, prompt, input, argv, refs, retry, auto, note } = job
   const asset = meta.asset
   const dir = path(asset)
   if (!(await takeLock($, dir))) return { deny: `${asset} 正在畫，等它結束再改。不同素材可以同時畫。` }
@@ -234,6 +278,7 @@ async function runJob($: $, job: Job): Promise<{ result: string } | { deny: stri
       selfNote: '',
       review: 'pending',
       note: '',
+      auto,
     }
     await saveMeta($, root, { ...meta, versions: [...meta.versions, entry] })
     await refreshAssets($)
@@ -242,9 +287,9 @@ async function runJob($: $, job: Job): Promise<{ result: string } | { deny: stri
     const file = `${dir}/${outcome.file}`
     if (meta.transparent && !outcome.png.alpha) {
       await notify($, failureNotice(asset, '這張沒有透明背景', '你要求透明，但輸出的圖沒有透明通道。', retry, 'no-alpha'))
-      return { result: `已存成 ${file}（v${version}，${outcome.png.width}×${outcome.png.height}），但這張沒有透明通道，不符合要求。請用 revise 重畫。` }
+      return { result: `已存成 ${file}（v${version}，${outcome.png.width}×${outcome.png.height}），但這張沒有透明通道，不符合要求。請用 revise 重畫。${note}` }
     }
-    return { result: `已存成 ${file}（v${version}，${outcome.png.width}×${outcome.png.height}，${outcome.elapsedS} 秒）。請用 Read 看圖，對照要求自檢，再呼叫 self_check。` }
+    return { result: `已存成 ${file}（v${version}，${outcome.png.width}×${outcome.png.height}，${outcome.elapsedS} 秒）。請用 Read 看圖，對照要求自檢，再呼叫 self_check。${note}` }
   } finally {
     await dropLock($, dir)
     await endJob($, asset)
@@ -270,18 +315,30 @@ async function startNew($: $, input: NewInput): Promise<{ result: string } | { d
     argv: newArgv(`${path(asset)}/.work`, refs),
     refs,
     retry: `請用 easel 重畫 ${asset}：${prompt}`,
+    auto: false,
+    note: '',
   })
 }
 
 async function startRevise($: $, input: ReviseInput): Promise<{ result: string } | { deny: string }> {
-  const { asset, prompt, base } = input
+  const { asset, prompt, base, limit } = input
   if (!asset || !prompt) return { deny: '缺素材名或修改要求。' }
-  const problem = await ready($)
-  if (problem) return { deny: problem }
+  if (!root || !home) return { deny: NOT_LOCATED }
   const meta = await loadMeta($, root, asset)
   if (!meta) return { deny: `找不到素材 ${asset}。新素材請用 new。` }
   const from = base === undefined ? latest(meta) : findVersion(meta, base)
   if (!from) return { deny: `${asset} 沒有 v${base}。` }
+  // 自檢與上限都在問 Codex 的狀態之前判斷：擋下來時連 codex --version 都不跑
+  const step = reviseStep(meta, from)
+  if (step.kind === 'unchecked') return { deny: uncheckedText(asset, from.n) }
+  let note = ''
+  if (step.kind === 'auto') {
+    const cap = await readLimit($, limit)
+    if (step.k > cap.limit) return { deny: limitReachedText(asset, step.k - 1, cap) }
+    note = autoStepText(step.k, cap)
+  }
+  const problem = await ready($)
+  if (problem) return { deny: problem }
   const version = nextVersion(meta)
   return runJob($, {
     meta,
@@ -292,6 +349,8 @@ async function startRevise($: $, input: ReviseInput): Promise<{ result: string }
     argv: reviseArgv(`${path(asset)}/.work`, from.threadId, `${path(asset)}/${from.file}`),
     refs: [],
     retry: `請用 easel 改 ${asset}（以 v${from.n} 為底）：${prompt}`,
+    auto: step.kind === 'auto',
+    note,
   })
 }
 
@@ -301,6 +360,16 @@ async function changeVersion($: $, asset: string, n: number, patch: Partial<Ease
   await saveMeta($, root, patchVersion(meta, n, patch))
   await refreshAssets($)
   return true
+}
+
+/**
+ * 人在面板上對某一版提修改：先在那一版記下 askedAt（人審過），再把要求送進對話，由 Claude 呼叫 revise。
+ * 面板和對話走的是同一個 revise 工具，分辨「人在面板發起」靠的就是這筆紀錄：只有這裡寫得到，工具寫不到，
+ * 所以不能用 revise 的參數來分（Claude 自己就能帶）。以它為底的 revise 不必先自檢，也不算自動修改。
+ */
+async function askFromPanel($: $, asset: string, n: number, text: string): Promise<void> {
+  await changeVersion($, asset, n, { askedAt: await $.clock.now() })
+  await $.prompt.submit({ text, asUser: true })
 }
 
 // ---- 登入 ------------------------------------------------------------------
@@ -369,13 +438,14 @@ function pollUsage($: $): void {
 type StartupStep = { label: string; when: 'register' | 'background' } & (
   | { kind: 'tool'; spec: (typeof TOOLS)[number] }
   | { kind: 'command'; spec: { name: string; description: string } }
-  | { kind: 'locate' | 'load-state' | 'poll-usage' }
+  | { kind: 'locate' | 'load-limit' | 'load-state' | 'poll-usage' }
 )
 
 const STARTUP: readonly StartupStep[] = [
   ...TOOLS.map((spec): StartupStep => ({ label: `工具 ${spec.name}`, when: 'register', kind: 'tool', spec })),
   { label: '找專案與家目錄', when: 'register', kind: 'locate' },
   { label: '/easel 指令', when: 'register', kind: 'command', spec: { name: 'easel', description: '打開 easel：看圖、審稿與 Codex 額度' } },
+  { label: '讀取自動修改上限', when: 'background', kind: 'load-limit' },
   { label: '讀取素材與 Codex 狀態', when: 'background', kind: 'load-state' },
   { label: '定時更新額度', when: 'background', kind: 'poll-usage' },
 ]
@@ -384,6 +454,7 @@ async function runStep($: $, step: StartupStep): Promise<void> {
   if (step.kind === 'tool') await $.tool.register(step.spec)
   else if (step.kind === 'command') await $.command.register(step.spec)
   else if (step.kind === 'locate') await locate($)
+  else if (step.kind === 'load-limit') await readLimit($)
   else if (step.kind === 'load-state') await loadState($)
   else pollUsage($)
 }
@@ -421,6 +492,7 @@ export const register: Register = on => {
 
   on('command.run', { command: 'easel' }, async $ => {
     await refreshAssets($)
+    await readLimit($)
     await refreshSetup($)
     refreshUsage($).catch(() => undefined)
     await update($, viewAtom, (): EaselView => ({ kind: 'home' }))
@@ -439,7 +511,19 @@ export const register: Register = on => {
     const { asset, version, pass, note = '' } = e as unknown as CheckInput
     if (!asset || version === undefined) return { deny: '缺素材名或版本。' }
     const done = await changeVersion($, asset, version, { selfCheck: pass ? 'pass' : 'fail', selfNote: note })
-    return done ? { result: `已記錄 ${asset} v${version} 的自檢。` } : { deny: `找不到 ${asset} v${version}。` }
+    if (!done) return { deny: `找不到 ${asset} v${version}。` }
+    // 不合格時先講清楚還能不能自動修改，Claude 不用撞到拒絕才知道到上限了
+    const meta = pass ? null : await loadMeta($, root, asset)
+    const checked = meta && findVersion(meta, version)
+    const step = meta && checked ? reviseStep(meta, checked) : null
+    if (!meta || step?.kind !== 'auto') return { result: `已記錄 ${asset} v${version} 的自檢。` }
+    const cap = await readLimit($)
+    return {
+      result:
+        step.k > cap.limit
+          ? `已記錄 ${asset} v${version} 的自檢。${limitReachedText(asset, step.k - 1, cap)}`
+          : `已記錄 ${asset} v${version} 的自檢。要自動修改的話，以 v${version} 為底 revise 會是連續第 ${step.k} 次，上限 ${cap.limit} 次（${LIMIT_SOURCE_TEXT[cap.source]}）。`,
+    }
   }).catch(() => ({ deny: 'easel 內部出錯，沒有記錄。' }))
 
   on('tool.run', { tool: 'mcp__easel__status' }, async $ => {
@@ -447,12 +531,21 @@ export const register: Register = on => {
     if (!(await read($, usageAtom))) await refreshUsage($)
     const assets = await refreshAssets($)
     const usage = await currentUsage($)
+    const cap = await readLimit($)
     const lines = assets.map(meta => {
       const last = latest(meta)
-      return `${meta.asset}: ${meta.versions.length} 版，最新 v${last?.n ?? 0}（${last?.review ?? '無'}）`
+      const streak = autoStreak(meta)
+      return `${meta.asset}: ${meta.versions.length} 版，最新 v${last?.n ?? 0}（${last?.review ?? '無'}）${streak > 0 ? `，已連續自動修改 ${streak} 次` : ''}`
     })
     const broken = (await read($, startupAtom)).map(problem => `啟動時「${problem.label}」沒成功：${problem.message}`)
-    return { result: [usage ? `Codex 額度已用 ${usage.percent}%，${usage.reset} 重置。` : 'Codex 額度未知。', ...lines, ...broken].join('\n') }
+    return {
+      result: [
+        usage ? `Codex 額度已用 ${usage.percent}%，${usage.reset} 重置。` : 'Codex 額度未知。',
+        `自動修改上限：${limitText(cap.limit)}（${LIMIT_SOURCE_TEXT[cap.source]}，可在 /easel 面板調）。`,
+        ...lines,
+        ...broken,
+      ].join('\n'),
+    }
   }).catch(() => ({ deny: 'easel 內部出錯，查不到狀態。' }))
 
   // Claude 自己叫 codex 生圖的話，easel 收不到圖也沒有檢查。其他 codex 用法不受影響。
@@ -652,6 +745,37 @@ export const register: Register = on => {
       ]
     }
 
+    /**
+     * 自動修改上限：桌面與手機畫卡片，終端機一行字。調整一律用 Button（手機沒有 Input）；
+     * 到 0 就沒有「減少」、到上限就沒有「增加」，沒調過就沒有「恢復預設」。數字讀面板的鏡像，按鈕寫回 $.store。
+     */
+    const limitSection = async (): Promise<RenderElement> => {
+      const cap = resolveLimit(await read($, limitAtom))
+      const adjusted = cap.source === 'panel'
+      const title = limitText(cap.limit)
+      const source = adjusted ? '你調的' : '預設'
+      const sub = cap.limit === 0 ? '自檢不合格時直接交給你，不自己重畫' : '自檢不合格時 Claude 自己重畫，到上限就交給你'
+      return section(
+        'limit',
+        '自動修改上限',
+        frame(
+          'limit-box',
+          undefined,
+          Svg ? (
+            art('limit-art', limitCard({ value: cap.limit, max: REVISE_LIMIT.max, title, sub, badge: { tone: adjusted ? 'a' : 'none', text: source } }))
+          ) : (
+            <Text>{`${title}（${source}）・${sub}`}</Text>
+          ),
+          row(
+            'limit-btns',
+            cap.limit > REVISE_LIMIT.min ? <Button key="limit-down" label="減少" onPress={() => stepLimit($, -1)} /> : null,
+            cap.limit < REVISE_LIMIT.max ? <Button key="limit-up" label="增加" onPress={() => stepLimit($, 1)} /> : null,
+            adjusted ? <Button key="limit-reset" label="恢復預設" onPress={() => storeLimit($, null)} /> : null,
+          ),
+        ),
+      )
+    }
+
     const homePage = async (): Promise<RenderElement> => {
       const assets = (await read($, assetsAtom)).slice().sort((a, b) => (latest(b)?.createdAt ?? 0) - (latest(a)?.createdAt ?? 0))
       const jobs = await read($, jobsAtom)
@@ -698,6 +822,7 @@ export const register: Register = on => {
           {await startupCards()}
           {await setupCards()}
           {await noticeCards()}
+          {await limitSection()}
           {pending.length > 0 ? section('pending', `等你審（${pending.length}）`, ...(await Promise.all(pending.map(card)))) : null}
           {jobs.length > 0 ? section('jobs', `正在畫（${jobs.length}）`, ...(await Promise.all(jobs.map(jobFrame)))) : null}
           {others.length > 0 ? section('assets', `素材（${others.length}）`, frame('assets-box', undefined, ...((await Promise.all(others.map(listRow))).filter(Boolean) as RenderElement[]))) : null}
@@ -791,7 +916,7 @@ export const register: Register = on => {
                       placeholder="例如：圍巾再長一點"
                       submitLabel="送出"
                       onSubmit={async value => {
-                        if (value.trim()) await $.prompt.submit({ text: `請用 easel 改 ${asset}（以 v${n} 為底）：${value.trim()}`, asUser: true })
+                        if (value.trim()) await askFromPanel($, asset, n, `請用 easel 改 ${asset}（以 v${n} 為底）：${value.trim()}`)
                       }}
                     />
                   ) : (
@@ -836,7 +961,7 @@ export const register: Register = on => {
               row(
                 'keep-btns',
                 <Button key="keep-right" label={`核准 v${right.n}`} variant="primary" onPress={review(asset, right.n, 'approved')} />,
-                <Button key="keep-left" label={`改用 v${left.n} 當底再畫`} onPress={() => $.prompt.submit({ text: `請用 easel 以 ${asset} 的 v${left.n} 為底再畫一版，先問我要改什麼。`, asUser: true })} />,
+                <Button key="keep-left" label={`改用 v${left.n} 當底再畫`} onPress={() => askFromPanel($, asset, left.n, `請用 easel 以 ${asset} 的 v${left.n} 為底再畫一版，先問我要改什麼。`)} />,
               ),
             ),
           )}

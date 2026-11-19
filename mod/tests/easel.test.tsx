@@ -75,6 +75,8 @@ type World = {
   sessionRoot?: string
   /** 權限檢查拒絕這次呼叫（人在對話框按了不允許） */
   denyPermission?: string
+  /** $.store 一開始存著的東西（上一場對話留下來的） */
+  store?: Record<string, unknown>
 }
 
 /** 2.1.326 的 sec-default 擋下「權限檢查之前」由外掛啟動的程式時，真引擎給的原話 */
@@ -91,9 +93,13 @@ function world(on: On, opts: World = {}) {
   const logs: string[] = []
   /** 走過權限檢查的工具呼叫，照順序 */
   const checked: string[] = []
+  /** 面板替人送進對話的話（$.prompt.submit） */
+  const prompts: string[] = []
   /** 剛通過權限檢查、還沒啟動程式的生圖呼叫 */
   let allowedDraw: string | null = null
   const thumbs = [...(opts.thumbs ?? [])]
+  /** 外掛自己的 $.store，跨對話保存；同一個測試裡再 session.start 也還在 */
+  const store: Record<string, unknown> = { ...(opts.store ?? {}) }
   /** 磁碟上的圖：路徑對修改時間 */
   const pngs: Record<string, number> = {}
   for (const png of opts.old ?? []) pngs[png.path] = png.mtimeMs
@@ -126,6 +132,20 @@ function world(on: On, opts: World = {}) {
   mock.clock(on, { now: 1_790_000_000_000 })
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', () => ({ value: undefined }))
+  on('store.get', ($, e) => ({ value: store[e.key] }))
+  on('store.set', ($, e) => {
+    store[e.key] = JSON.parse(JSON.stringify(e.value))
+    return { value: undefined }
+  })
+  on('store.delete', ($, e) => {
+    delete store[e.key]
+    return { value: undefined }
+  })
+  on('store.keys', () => ({ value: Object.keys(store) }))
+  on('prompt.submit', ($, e) => {
+    prompts.push(e.text)
+    return { text: e.text }
+  })
   on('fs.exists', ($, e) => ({ value: paths().some(f => f === e.path || f.startsWith(`${e.path}/`)) || (opts.unreadable ?? []).includes(e.path) }))
   on('fs.read', ($, e) => {
     if (/\/\.thumbs\/[^/]+\.(webp|jpg)$/.test(e.path)) return { value: { base64: opts.hugeThumbs ? 'A'.repeat(130_000) : (thumbs.shift() ?? 'QUJD') } }
@@ -190,7 +210,7 @@ function world(on: On, opts: World = {}) {
     for (const line of opts.events ?? [`{"type":"thread.started","thread_id":"${THREAD}"}`]) yield { stream: 'stdout' as const, text: `${line}\n` }
     return { value: { code: 0, signal: null } }
   })
-  return { files, runs, spawns, lists, tools, commands, logs, checked }
+  return { files, runs, spawns, lists, tools, commands, logs, checked, store, prompts }
 }
 
 const start = ($: Engine) => $.session.start({ cwd: CWD, surface: 'desktop', isInteractive: true })
@@ -682,4 +702,291 @@ test('權限檢查不允許：不啟動 codex、不上鎖、不寫紀錄，不�
   expect(w.spawns.length).toBe(0)
   expect(w.runs.some(argv => argv[0] === 'mkdir' && argv.join(' ').includes('/art/fox/'))).toBe(false)
   expect(w.files[`${CWD}/art/fox/meta.json`]).toBeUndefined()
+})
+
+// ---- 自動修改的上限：程式自己數，到上限不啟動 codex ----------------------------------
+// 起因：「自動修改最多 2 次」原本只寫在技能與工具說明裡，程式沒有任何地方知道這個數字，Claude 多畫幾次也沒有東西擋。
+// 上限三層：預設值 2 → 面板上調的（$.store）→ 這次 revise 帶的 limit。
+
+const FAIL = { selfCheck: 'fail' as const, selfNote: '圍巾顏色不對' }
+const DRAWN = `${IMAGES}/${THREAD}/exec-a.png`
+/** v1 不合格，接著兩次自動修改也不合格：預設的 2 次已經用完 */
+const usedUp = () => meta('fox', [version(1, FAIL), version(2, { ...FAIL, auto: true }), version(3, { ...FAIL, auto: true })])
+const savedMeta = (files: Record<string, string>) => JSON.parse(files[`${CWD}/art/fox/meta.json`] ?? '{}') as EaselMeta
+const revise = ($: Engine, extra: Record<string, unknown> = {}) => $.tool.call({ tool: 'mcp__easel__revise', asset: 'fox', prompt: '圍巾改紅', ...extra } as never)
+const status = async ($: Engine) => served(await $.tool.call({ tool: 'mcp__easel__status' } as never))
+/** 這個素材的資料夾有沒有被動到（上鎖、建 .work）：到上限時一樣都不該有 */
+const touched = (runs: string[][]) => runs.some(argv => argv.join(' ').includes(`${CWD}/art/fox/`))
+
+test('自檢不合格後自動修改：沒到上限就畫，結果寫連續第幾次、上限幾次與來源，新版記成自動修改', async ($, on) => {
+  const w = world(on, { metas: [meta('fox', [version(1, FAIL)])], images: [DRAWN] })
+  await start($)
+  const text = served(await revise($))
+  expect(text).toContain('v2.png')
+  expect(text).toContain('這是連續第 1 次自動修改，上限 2 次（預設）。')
+  expect(savedMeta(w.files).versions[1]?.auto).toBe(true)
+  expect(w.spawns.length).toBe(1)
+})
+
+test('到上限：不啟動 codex、不上鎖、不留版本；說清楚連續幾次、上限幾次、哪一層定的、怎麼繼續', async ($, on) => {
+  const w = world(on, { metas: [usedUp()], images: [DRAWN] })
+  await start($)
+  const deny = refused(await revise($))
+  expect(deny).toContain('已經連續自動修改 2 次')
+  expect(deny).toContain('上限是 2 次（預設）')
+  expect(deny).toContain('交給使用者')
+  expect(deny).toContain('limit')
+  expect(deny).toContain('/easel 面板')
+  expect(w.spawns.length).toBe(0)
+  expect(touched(w.runs)).toBe(false)
+  expect(savedMeta(w.files).versions.length).toBe(3)
+  // 指定 base 回到第一版也一樣擋：次數照版本號數，不會因為換了底圖就歸零
+  expect(refused(await revise($, { base: 1 }))).toContain('已經連續自動修改 2 次')
+  expect(w.spawns.length).toBe(0)
+})
+
+test('使用者說了這次可以改幾次就帶 limit：可以多改，結果寫「這次指定」', async ($, on) => {
+  const w = world(on, { metas: [usedUp()], images: [DRAWN] })
+  await start($)
+  expect(served(await revise($, { limit: 4 }))).toContain('這是連續第 3 次自動修改，上限 4 次（這次指定）。')
+  expect(savedMeta(w.files).versions.map(v => v.n)).toEqual([1, 2, 3, 4])
+  expect(w.spawns.length).toBe(1)
+})
+
+test('limit 是 0 就不自動修改；超出範圍夾到 10', async ($, on) => {
+  const w = world(on, { metas: [meta('fox', [version(1, FAIL)])], images: [DRAWN] })
+  await start($)
+  expect(refused(await revise($, { limit: 0 }))).toContain('上限是 0（這次指定，不自動修改）')
+  expect(w.spawns.length).toBe(0)
+  expect(served(await revise($, { limit: 99 }))).toContain('上限 10 次（這次指定）')
+})
+
+for (const [label, last] of [
+  ['自檢合格', { selfCheck: 'pass', selfNote: '對' }],
+  ['人在面板退回過', { ...FAIL, review: 'rejected' }],
+  ['人在面板提過修改（還沒自檢）', { selfCheck: 'pending', selfNote: '', askedAt: 5 }],
+] as const) {
+  test(`接在${label}的版本後面：是使用者要求的修改，不算自動修改，上限 0 也照畫`, async ($, on) => {
+    const w = world(on, { metas: [meta('fox', [version(1, FAIL), version(2, { ...FAIL, auto: true }), version(3, { auto: true, ...last })])], images: [DRAWN], store: { reviseLimit: 0 } })
+    await start($)
+    const text = served(await revise($))
+    expect(text).toContain('v4.png')
+    expect(text).not.toContain('自動修改')
+    expect(savedMeta(w.files).versions[3]?.auto).toBe(false)
+  })
+}
+
+test('舊的 meta.json 沒有 auto 欄位：照常讀得到、面板畫得出來，次數照底圖推回來', async ($, on) => {
+  const old = meta('fox', [version(1, FAIL), version(2, FAIL), version(3, FAIL)])
+  expect(JSON.stringify(old)).not.toContain('"auto"')
+  const w = world(on, { metas: [old], images: [DRAWN] })
+  await start($)
+  expect(refused(await revise($))).toContain('已經連續自動修改 2 次')
+  expect(await status($)).toContain('fox: 3 版，最新 v3（pending），已連續自動修改 2 次')
+  await openPane($)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await seen(ui, /fox/)).toBe(true)
+  await ui.unmount()
+  // 照樣能往下畫，新的一版記上 auto，舊的幾版原封不動
+  expect(served(await revise($, { limit: 3 }))).toContain('連續第 3 次')
+  const saved = savedMeta(w.files)
+  expect(saved.versions[3]?.auto).toBe(true)
+  expect(saved.versions.slice(0, 3).every(v => v.auto === undefined)).toBe(true)
+})
+
+test('自檢不合格時先告訴 Claude 還能不能自動修改；合格就只記錄', async ($, on) => {
+  world(on, { metas: [meta('fox', [version(1, FAIL), version(2, { auto: true, selfCheck: 'pending', selfNote: '' })]), meta('cat', [version(1, { selfCheck: 'pending', selfNote: '' })])] })
+  await start($)
+  const check = (asset: string, version: number, pass: boolean) => $.tool.call({ tool: 'mcp__easel__self_check', asset, version, pass, note: '看過' } as never)
+  expect(served(await check('fox', 2, false))).toContain('會是連續第 2 次，上限 2 次（預設）')
+  expect(served(await check('cat', 1, true))).toBe('已記錄 cat v1 的自檢。')
+})
+
+test('自檢不合格、已經到上限：自檢的結果就叫 Claude 停下來交給使用者', async ($, on) => {
+  world(on, { metas: [meta('fox', [version(1, FAIL), version(2, { ...FAIL, auto: true }), version(3, { auto: true, selfCheck: 'pending', selfNote: '' })])] })
+  await start($)
+  const text = served(await $.tool.call({ tool: 'mcp__easel__self_check', asset: 'fox', version: 3, pass: false, note: '還是不對' } as never))
+  expect(text).toContain('已經連續自動修改 2 次')
+  expect(text).toContain('交給使用者')
+})
+
+// ---- 在 /easel 面板上調上限 ------------------------------------------------------
+// 持久的只有面板這一層（$.store，跨對話）。手機沒有 Input，調整只用 Button，三種介面都要能調。
+
+const LIMIT_ALT = /^自動修改上限：/
+
+for (const surface of ['terminal', 'desktop', 'mobile'] as const) {
+  test(`面板調上限（${surface}）：增加、減少、恢復預設，數字與來源跟著重畫，存進 $.store`, async ($, on) => {
+    const w = world(on)
+    await start($)
+    await openPane($)
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const cards = async () => (await ui.findAll({ type: 'Svg' })).filter(el => LIMIT_ALT.test(String(el.props.alt ?? ''))).length
+    // 桌面與手機畫卡片，終端機沒有 Svg、改用一行字
+    expect(await cards()).toBe(surface === 'terminal' ? 0 : 1)
+    expect(await seen(ui, /最多 2 次（預設）/)).toBe(true)
+    expect(await ui.find({ key: 'limit-reset' })).toBeUndefined()
+
+    await ui.press({ key: 'limit-up' })
+    expect(w.store.reviseLimit).toBe(3)
+    expect(await seen(ui, /最多 3 次（你調的）/)).toBe(true)
+    expect(await ui.find({ key: 'limit-reset' })).toBeDefined()
+
+    // 調回預設值就不存，來源回到「預設」
+    await ui.press({ key: 'limit-down' })
+    expect('reviseLimit' in w.store).toBe(false)
+    expect(await seen(ui, /最多 2 次（預設）/)).toBe(true)
+
+    // 減到 0：不自動修改，沒有「減少」可按
+    await ui.press({ key: 'limit-down' })
+    await ui.press({ key: 'limit-down' })
+    expect(w.store.reviseLimit).toBe(0)
+    expect(await seen(ui, /不自動修改（你調的）/)).toBe(true)
+    expect(await ui.find({ key: 'limit-down' })).toBeUndefined()
+
+    await ui.press({ key: 'limit-reset' })
+    expect('reviseLimit' in w.store).toBe(false)
+    expect(await seen(ui, /最多 2 次（預設）/)).toBe(true)
+    await ui.unmount()
+  })
+}
+
+test('面板的上限夾在 0 到 10：到 10 就沒有「增加」；$.store 裡壞掉或超出的值照範圍讀', async ($, on) => {
+  const w = world(on, { store: { reviseLimit: 9 } })
+  await start($)
+  await openPane($)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await seen(ui, /最多 9 次（你調的）/)).toBe(true)
+  await ui.press({ key: 'limit-up' })
+  expect(w.store.reviseLimit).toBe(10)
+  expect(await seen(ui, /最多 10 次（你調的）/)).toBe(true)
+  expect(await ui.find({ key: 'limit-up' })).toBeUndefined()
+  await ui.unmount()
+
+  w.store.reviseLimit = 99
+  expect(await status($)).toContain('自動修改上限：最多 10 次（你在面板調的')
+  w.store.reviseLimit = '壞掉'
+  expect(await status($)).toContain('自動修改上限：最多 2 次（預設')
+})
+
+test('上一場對話在面板調過：新對話一開始，面板、revise、status 都照存著的值', async ($, on) => {
+  world(on, { metas: [usedUp()], images: [DRAWN], store: { reviseLimit: 3 } })
+  await start($)
+  expect(await status($)).toContain('自動修改上限：最多 3 次（你在面板調的，可在 /easel 面板調）。')
+  await openPane($)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await seen(ui, /最多 3 次（你調的）/)).toBe(true)
+  await ui.unmount()
+  expect(served(await revise($))).toContain('這是連續第 3 次自動修改，上限 3 次（你在面板調的）。')
+})
+
+test('面板上調的值跨 session.start 還在', async ($, on) => {
+  const w = world(on, { metas: [usedUp()], images: [DRAWN] })
+  await start($)
+  await openPane($)
+  const ui = await $.ui.mount({ ...PANE, surface: 'mobile' })
+  await ui.press({ key: 'limit-up' })
+  await ui.unmount()
+  await start($)
+  expect(w.store.reviseLimit).toBe(3)
+  await openPane($)
+  const again = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await seen(again, /最多 3 次（你調的）/)).toBe(true)
+  await again.unmount()
+  expect(await status($)).toContain('自動修改上限：最多 3 次（你在面板調的')
+})
+
+test('按了立刻生效：到上限被擋，面板加一次就能畫；status 和面板讀同一個值', async ($, on) => {
+  const w = world(on, { metas: [usedUp()], images: [DRAWN] })
+  await start($)
+  expect(await status($)).toContain('自動修改上限：最多 2 次（預設')
+  expect(refused(await revise($))).toContain('上限是 2 次（預設）')
+  expect(w.spawns.length).toBe(0)
+
+  await openPane($)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'limit-up' })
+  expect(await status($)).toContain('自動修改上限：最多 3 次（你在面板調的')
+  expect(served(await revise($))).toContain('這是連續第 3 次自動修改，上限 3 次（你在面板調的）。')
+  expect(w.spawns.length).toBe(1)
+
+  // 畫好時面板跳到新的那一版；回首頁按恢復預設，下一次又照 2 次判斷
+  await ui.press({ key: 'back' })
+  await ui.press({ key: 'limit-reset' })
+  await ui.unmount()
+  expect(await status($)).toContain('自動修改上限：最多 2 次（預設')
+  await $.tool.call({ tool: 'mcp__easel__self_check', asset: 'fox', version: 4, pass: false, note: '還是不對' } as never)
+  expect(refused(await revise($))).toContain('已經連續自動修改 3 次，上限是 2 次（預設）')
+  expect(w.spawns.length).toBe(1)
+})
+
+// ---- 底圖要先有自檢結果 ----------------------------------------------------------
+// 起因：接在「還沒自檢」的版本後面的 revise 原本不算自動修改，Claude 跳過 self_check 就能一直改、繞過上限。
+// 現在用工具發起的修改，底圖一定要自檢過或人審過；人在面板發起的修改靠面板寫下的 askedAt 分辨（工具寫不到）。
+
+const UNCHECKED = { selfCheck: 'pending' as const, selfNote: '' }
+
+test('底圖還沒自檢：revise 被拒絕，不啟動 codex、不上鎖、不留版本；自檢之後就能改', async ($, on) => {
+  const w = world(on, { metas: [meta('fox', [version(1, UNCHECKED)])], images: [DRAWN] })
+  await start($)
+  const deny = refused(await revise($))
+  expect(deny).toContain('v1 還沒自檢')
+  expect(deny).toContain('Read')
+  expect(deny).toContain('self_check')
+  expect(w.spawns.length).toBe(0)
+  expect(touched(w.runs)).toBe(false)
+  expect(savedMeta(w.files).versions.length).toBe(1)
+
+  // 自檢不合格之後：可以改，算自動修改
+  await $.tool.call({ tool: 'mcp__easel__self_check', asset: 'fox', version: 1, pass: false, note: '圍巾顏色不對' } as never)
+  expect(served(await revise($))).toContain('這是連續第 1 次自動修改')
+  expect(w.spawns.length).toBe(1)
+
+  // 新畫好的 v2 也還沒自檢：再改一樣要先自檢，不能接著一直畫
+  expect(refused(await revise($))).toContain('v2 還沒自檢')
+  expect(w.spawns.length).toBe(1)
+})
+
+test('自檢合格之後的修改：不算自動修改，上限 0 也照畫', async ($, on) => {
+  const w = world(on, { metas: [meta('fox', [version(1, UNCHECKED)])], images: [DRAWN], store: { reviseLimit: 0 } })
+  await start($)
+  await $.tool.call({ tool: 'mcp__easel__self_check', asset: 'fox', version: 1, pass: true, note: '對' } as never)
+  const text = served(await revise($))
+  expect(text).not.toContain('自動修改')
+  expect(savedMeta(w.files).versions[1]?.auto).toBe(false)
+})
+
+test('面板審稿頁輸入修改要求：先記下人審過，再送進對話；以它為底的 revise 不必先自檢，也不算自動修改', async ($, on) => {
+  const w = world(on, { metas: [meta('fox', [version(1, UNCHECKED)])], images: [DRAWN], store: { reviseLimit: 0 } })
+  await start($)
+  await openPane($)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'open-fox' })
+  await ui.input({ key: 'ask', text: '圍巾改紅' })
+  await ui.unmount()
+  expect(w.prompts).toEqual(['請用 easel 改 fox（以 v1 為底）：圍巾改紅'])
+  expect(typeof savedMeta(w.files).versions[0]?.askedAt).toBe('number')
+  // Claude 收到那句話後呼叫 revise：沒自檢也照畫，上限 0 也不擋
+  const text = served(await revise($))
+  expect(text).toContain('v2.png')
+  expect(text).not.toContain('自動修改')
+  expect(savedMeta(w.files).versions[1]?.auto).toBe(false)
+  expect(w.spawns.length).toBe(1)
+})
+
+test('面板比較頁「改用上一版當底再畫」：一樣記下人審過，以那一版為底的 revise 不受自檢這條限制', async ($, on) => {
+  const w = world(on, { metas: [meta('fox', [version(1, UNCHECKED), version(2, UNCHECKED)])], images: [DRAWN] })
+  await start($)
+  // 對照：沒經過面板，以 v1 為底會被擋
+  expect(refused(await revise($, { base: 1 }))).toContain('v1 還沒自檢')
+  await openPane($)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'open-fox' })
+  await ui.press({ key: 'compare' })
+  await ui.press({ key: 'keep-left' })
+  await ui.unmount()
+  expect(w.prompts.length).toBe(1)
+  expect(typeof savedMeta(w.files).versions[0]?.askedAt).toBe('number')
+  expect(savedMeta(w.files).versions[1]?.askedAt).toBeUndefined()
+  expect(served(await revise($, { base: 1 }))).toContain('v3.png')
 })

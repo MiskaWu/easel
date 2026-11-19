@@ -38,6 +38,127 @@ export function patchVersion(meta: EaselMeta, n: number, patch: Partial<EaselVer
   return { ...meta, versions: meta.versions.map(v => (v.n === n ? { ...v, ...patch } : v)) }
 }
 
+// ---- 自動修改的上限 ----------------------------------------------------------
+//
+// 自檢不合格時 Claude 會自己 revise 重畫。這裡決定「最多連續幾次」，程式真的會數，到了就拒絕、不啟動 codex。
+// 上限有三層，後者蓋過前者：程式的預設值 → 人在 /easel 面板上調的值（$.store，跨對話保存）→ 使用者在對話裡當次說的（revise 的 limit）。
+// 持久的只有面板那一層：再多一個持久的地方（例如外掛設定）兩邊會打架，看不出現在是誰說了算。
+
+/** 預設值、可調的範圍。改預設值會改到每個沒調過的人，維持 2。 */
+export const REVISE_LIMIT = { default: 2, min: 0, max: 10 } as const
+
+/** 上限從哪一層來：預設值、面板上調的、這次 revise 帶的 limit。 */
+export type LimitSource = 'default' | 'panel' | 'call'
+
+export const LIMIT_SOURCE_TEXT: Record<LimitSource, string> = { default: '預設', panel: '你在面板調的', call: '這次指定' }
+
+export type ReviseLimit = { limit: number; source: LimitSource }
+
+/** 收進範圍：不是數字（含 NaN、字串、沒給）回 null；小數四捨五入；超出就夾住。 */
+export function clampLimit(value: unknown): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null
+  return Math.min(REVISE_LIMIT.max, Math.max(REVISE_LIMIT.min, Math.round(value)))
+}
+
+/** 這次的上限：當次指定 → 面板上存的 → 預設值，取第一個有效的。stored 是 $.store 裡的原值，壞掉就當沒調過。 */
+export function resolveLimit(stored: unknown, requested?: unknown): ReviseLimit {
+  const call = clampLimit(requested)
+  if (call !== null) return { limit: call, source: 'call' }
+  const panel = clampLimit(stored)
+  if (panel !== null) return { limit: panel, source: 'panel' }
+  return { limit: REVISE_LIMIT.default, source: 'default' }
+}
+
+/** 面板按了增加或減少之後要存的值。調回預設值就不存（回 null），來源跟著回到「預設」，只有一種 2。 */
+export function storedLimitAfter(current: number, delta: number): number | null {
+  const next = clampLimit(current + delta) ?? REVISE_LIMIT.default
+  return next === REVISE_LIMIT.default ? null : next
+}
+
+/** 給人看的上限：0 是「不自動修改」。 */
+export function limitText(limit: number): string {
+  return limit === 0 ? '不自動修改' : `最多 ${limit} 次`
+}
+
+/**
+ * 人審過這一版：在面板核准、退回過，或在面板上對它提了修改要求（askedAt）。
+ * 這三件都只有面板的按鈕與輸入框寫得到，工具寫不到，所以 Claude 沒辦法替人「審過」。
+ */
+export function humanReviewed(v: EaselVersion): boolean {
+  return v.review !== 'pending' || typeof v.askedAt === 'number'
+}
+
+/** 人已經接手的版本：自檢合格，或人審過。連續自動修改數到這裡就停。 */
+function handedOver(v: EaselVersion): boolean {
+  return v.selfCheck === 'pass' || humanReviewed(v)
+}
+
+/** 接在這一版後面的 revise 算自動修改：自檢不合格，而且人還沒審過。 */
+export function isAutoBase(v: EaselVersion): boolean {
+  return v.selfCheck === 'fail' && !humanReviewed(v)
+}
+
+/** 這一版是不是自動修改畫出來的。0.1.4 起寫在 auto；更舊的 meta.json 沒有這個欄位，就看它的底圖現在是不是「不合格、沒人審」。 */
+export function wasAuto(meta: EaselMeta, v: EaselVersion): boolean {
+  if (typeof v.auto === 'boolean') return v.auto
+  if (v.base === null) return false
+  const base = findVersion(meta, v.base)
+  return base ? isAutoBase(base) : false
+}
+
+/**
+ * 這個素材目前已經連續自動修改了幾次：照版本號從最新往回數，數到人接手的版本、不是自動修改的版本（第一版、使用者要求的修改）為止。
+ * 照版本號數、不照底圖的鏈數：指定 base 回到更早的不合格版本，不會讓次數歸零。
+ */
+export function autoStreak(meta: EaselMeta): number {
+  let count = 0
+  for (const v of meta.versions.slice().sort((a, b) => b.n - a.n)) {
+    if (handedOver(v) || !wasAuto(meta, v)) break
+    count++
+  }
+  return count
+}
+
+/**
+ * 以 from 為底 revise 是哪一種，只看底圖那一版：
+ * - 自檢合格或人審過 → manual：使用者要求的修改，不受上限限制；
+ * - 自檢不合格且人沒審 → auto：自動修改，k 是連續第幾次；
+ * - 還沒自檢、人也沒審 → unchecked：不能改，要先自檢。沒有這一條的話，跳過 self_check 就能繞過上限。
+ */
+export type ReviseStep = { kind: 'manual' } | { kind: 'auto'; k: number } | { kind: 'unchecked' }
+
+export function reviseStep(meta: EaselMeta, from: EaselVersion): ReviseStep {
+  if (from.selfCheck === 'pass' || humanReviewed(from)) return { kind: 'manual' }
+  if (from.selfCheck === 'fail') return { kind: 'auto', k: autoStreak(meta) + 1 }
+  return { kind: 'unchecked' }
+}
+
+/** 底圖還沒自檢、這次不畫時回給 Claude 的話。 */
+export function uncheckedText(asset: string, n: number): string {
+  return (
+    `${asset} v${n} 還沒自檢，這次不畫。請先用 Read 看 v${n} 的圖，對照要求用 self_check 記錄這一版，再決定要不要修改：` +
+    '合格之後的修改是使用者要求的；不合格之後的修改算自動修改，受上限限制。'
+  )
+}
+
+/** 到上限、這次不畫時回給 Claude 的話：連續幾次、上限幾次、哪一層定的、怎麼繼續。 */
+export function limitReachedText(asset: string, done: number, cap: ReviseLimit): string {
+  const head =
+    cap.limit === 0
+      ? `${asset} 的自動修改上限是 0（${LIMIT_SOURCE_TEXT[cap.source]}，不自動修改），這次不畫。`
+      : `${asset} 已經連續自動修改 ${done} 次，上限是 ${cap.limit} 次（${LIMIT_SOURCE_TEXT[cap.source]}），這次不畫。`
+  return (
+    head +
+    '請停下來，把各版的自檢結果交給使用者判斷。' +
+    '使用者要你繼續改的話，請他說這次可以改到幾次，再把那個數字帶在 revise 的 limit；要長期調整，請他在 /easel 面板調「自動修改上限」。'
+  )
+}
+
+/** 自動修改畫好後補在結果後面的一句。 */
+export function autoStepText(k: number, cap: ReviseLimit): string {
+  return `這是連續第 ${k} 次自動修改，上限 ${cap.limit} 次（${LIMIT_SOURCE_TEXT[cap.source]}）。`
+}
+
 /** 寫壞或舊版的 meta.json 不要把面板弄掛：讀不懂就當沒有這個素材。 */
 export function parseMeta(text: string): EaselMeta | null {
   try {

@@ -282,6 +282,36 @@ export function alertCard(d: { tone: 'warn' | 'crit'; title: string; detail?: st
   return { source: svg(w, h, body), alt: `${d.title}。${d.detail ?? ''}`, height: h }
 }
 
+export type LimitCardData = {
+  /** 現在的上限 */
+  value: number
+  /** 可調到多少，量表就有幾格 */
+  max: number
+  /** 第一行，例如「最多自動修改 2 次」「不自動修改」 */
+  title: string
+  /** 第二行的說明 */
+  sub: string
+  /** 右上角的來源：預設是中性、調過的用強調色 */
+  badge: { tone: string; text: string }
+}
+
+/**
+ * 自動修改上限：標題＋來源膠囊、一句說明、一排格子（亮幾格＝上限幾次）。圖不能按，增減與恢復預設是下面的 Button。
+ * 格子和「正在畫」卡片的進度條同一種長相：5 高、圓角、間隔 4。
+ */
+export function limitCard(d: LimitCardData, w = 396): Drawing {
+  const h = 60
+  const badge = pill(w, 12, d.badge.tone, d.badge.text, 'end')
+  let body = txt(0, 17, d.value === 0 ? 't2' : 't1', 14, fit(d.title, 14, w - badge.w - 12), 'font-weight="600"') + badge.svg
+  body += txt(0, 38, 't3', 12, fit(d.sub, 12, w))
+  const gap = 4
+  const cell = (w - gap * (d.max - 1)) / d.max
+  for (let i = 0; i < d.max; i++) {
+    body += `<rect x="${(i * (cell + gap)).toFixed(1)}" y="52" width="${cell.toFixed(1)}" height="5" rx="2.5" class="${i < d.value ? 'a' : 'panel'}"/>`
+  }
+  return { source: svg(w, h, body), alt: `自動修改上限：${d.title}（${d.badge.text}）。${d.sub}。可調 0 到 ${d.max} 次。`, height: h }
+}
+
 /** 首次設定的一列：項目＋狀態。 */
 export function setupRow(d: { label: string; badge: { tone: string; text: string } }, w = 396): Drawing {
   const b = pill(w, 12, d.badge.tone, d.badge.text, 'end')
