@@ -46,6 +46,12 @@ Linux、WSL、macOS 都要能跑。macOS 的指令是 BSD 版，GNU 才有的寫
 - 手機沒有 `Input`、`Client`。
 - `claude plugin test` 裡 `process.spawn` 的替身要用 `async function*`，而且回傳 `{ value: { code, signal } }`。
 - 測試的替身站在引擎的位置，引擎自己會拒絕的事（指令撞名、政策擋工具）在測試裡不會發生，要讓替身回 `{ deny }` 才測得到。真引擎的行為用 `claude -p --plugin-dir mod --debug-file <檔>` 看 log。
+- **四個工具都在 `tool.run` 服務，不在 `tool.call`。** `tool.call` 在權限檢查之前，`tool.run` 在權限檢查通過、真的要執行的那一刻。2.1.326 起內建的安全外掛 sec-default 會擋「權限檢查之前」由外掛啟動的外部程式：在 `tool.call` 裡 spawn codex，每次都得到「Codex 沒畫出來：easel: $.process.spawn: this repeats a Bash call that is not allowed; serve an allowed call at tool.run」，用 `--allowedTools` 事先允許工具也一樣，不是設定能解的。同一條指令在同一場對話被擋過之後，再送一次（即使改在 `tool.run`）也會被擋，所以實測要開新對話。
+  - `tool.run` 回的 `{ deny }` 是這次呼叫的錯誤，和工具自己出錯一樣：模型照樣讀得到原因，但測試裡的 `$.tool.call` 拿到的是 `{ isError: true, text }`，不是 `{ deny }`（測試用 `refused()` 讀）。
+  - 權限檢查不允許時 `tool.run` 不會觸發，codex 不會被啟動。測試的替身照 sec-default 只在權限檢查之後放行 spawn，並記下每次呼叫有沒有走過檢查；有工具改回 `tool.call`，測試會紅。
+  - 擋直接呼叫 codex 的 Bash 閘門仍在 `tool.call`：它要在權限檢查之前擋，而且不啟動程式。
+  - `tool.run` 是 2.1.326 才有的事件（2.1.325 的型別檔還沒有）。更舊的版本不認得它，整個模組載不起來，四個工具全部不見（2.1.322 實測：`"tool.run" is not an event`）。
+- **最低引擎版本寫在 `mod/.claude-plugin/plugin.json` 的 `engines["claude-code"]`**（0.1.3 起是 `>=2.1.326`）。不在程式裡看版本號分岔。引擎從 2.1.323 起認得這個欄位：安裝與更新時挑「範圍相符的最新一版」，往回找最多五個 `easel--v<版本>` 標籤。所以**每次升版本號都要打標籤** `easel--v<版本>` 並推上去，舊引擎才找得到能用的那一版（2.1.323 到 2.1.325 會裝到 `easel--v0.1.2`）。2.1.322 以前不認得這個欄位，裝到新版會整個載不起來，只能升級 Claude Code。
 
 ## 測試
 
@@ -56,6 +62,8 @@ cd mod
 claude plugin test .
 claude plugin validate .
 ```
+
+`claude` 要是 2.1.326 以上（`claude --version`）。更舊的版本不認得 `tool.run`，`easel.test.tsx` 會整個紅，那不是程式壞了。PATH 上的太舊時，用桌面版內附的那份（環境變數 `$CLAUDE_CODE_EXECPATH`）。
 
 型別檢查要一份放在 repo 外的 tsconfig（內容見引擎型別檔開頭），或在 mod 載入過一次後跑 `npx -y -p typescript@5.6.3 tsc -p mod`。
 

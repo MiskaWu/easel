@@ -73,7 +73,13 @@ type World = {
   gitRoot?: string
   /** 引擎回報的專案根目錄 */
   sessionRoot?: string
+  /** 權限檢查拒絕這次呼叫（人在對話框按了不允許） */
+  denyPermission?: string
 }
+
+/** 2.1.326 的 sec-default 擋下「權限檢查之前」由外掛啟動的程式時，真引擎給的原話 */
+const SEC_DEFAULT = '$.process.spawn: this repeats a Bash call that is not allowed; serve an allowed call at tool.run'
+const DRAW_TOOLS = ['mcp__easel__new', 'mcp__easel__revise']
 
 function world(on: On, opts: World = {}) {
   const files: Record<string, string> = {}
@@ -83,6 +89,10 @@ function world(on: On, opts: World = {}) {
   const tools: string[] = []
   const commands: string[] = []
   const logs: string[] = []
+  /** 走過權限檢查的工具呼叫，照順序 */
+  const checked: string[] = []
+  /** 剛通過權限檢查、還沒啟動程式的生圖呼叫 */
+  let allowedDraw: string | null = null
   const thumbs = [...(opts.thumbs ?? [])]
   /** 磁碟上的圖：路徑對修改時間 */
   const pngs: Record<string, number> = {}
@@ -160,7 +170,18 @@ function world(on: On, opts: World = {}) {
     if (argv[0] === 'ffmpeg' || argv[0] === 'sips') return opts.noThumbTool ? out('', 127) : out('')
     return out('')
   })
+  // 權限檢查。工具若在 tool.call 就自己回答，引擎會跳過這一步，這裡就不會被叫到。
+  on('tool.check', ($, e) => {
+    checked.push(e.tool)
+    if (opts.denyPermission) return { decision: 'deny' as const, reason: opts.denyPermission }
+    allowedDraw = DRAW_TOOLS.includes(e.tool) ? e.tool : null
+    return { decision: 'allow' as const }
+  })
+  // 照 2.1.326 的 sec-default：生圖呼叫通過權限檢查（到了 tool.run）才准啟動 codex，一次檢查換一次啟動。
+  // 原本的替身一律放行，所以工具在 tool.call 就 spawn、真引擎每次都擋的情況，在測試裡全綠。
   on('process.spawn', async function* ($, e) {
+    if (!allowedDraw) throw new Error(SEC_DEFAULT)
+    allowedDraw = null
     spawns.push({ argv: e.argv, ...(e.input === undefined ? {} : { input: e.input }) })
     ;(opts.images ?? []).forEach((image, i) => {
       if (typeof image === 'string') pngs[image] = 100_500 + i * 1000
@@ -169,10 +190,23 @@ function world(on: On, opts: World = {}) {
     for (const line of opts.events ?? [`{"type":"thread.started","thread_id":"${THREAD}"}`]) yield { stream: 'stdout' as const, text: `${line}\n` }
     return { value: { code: 0, signal: null } }
   })
-  return { files, runs, spawns, lists, tools, commands, logs }
+  return { files, runs, spawns, lists, tools, commands, logs, checked }
 }
 
 const start = ($: Engine) => $.session.start({ cwd: CWD, surface: 'desktop', isInteractive: true })
+
+type Out = { deny?: string; isError?: boolean; result?: unknown; text?: string }
+/** 工具在 tool.run 回的 { deny } 是這次呼叫的錯誤，和工具自己出錯一樣：$.tool.call 拿到的是 isError 與錯誤文字 */
+const refused = (out: unknown): string => {
+  expect((out as Out).isError).toBe(true)
+  return String((out as Out).text)
+}
+/** 畫好了：不是錯誤，回的是給 Claude 的那段話 */
+const served = (out: unknown): string => {
+  expect((out as Out).isError).toBeUndefined()
+  expect((out as Out).deny).toBeUndefined()
+  return String((out as Out).result)
+}
 const openPane = ($: Engine) => $.command.run({ command: 'easel', args: '' } as never)
 
 type Drawing = { find: (q: { text: RegExp }) => Promise<unknown>; findAll: (q: { type?: string }) => Promise<{ props: Record<string, unknown> }[]> }
@@ -258,7 +292,7 @@ test('macOS 沒裝 Codex：請他用自己管理工具的方式裝，不教 curl
   expect(await ui.find({ key: 'recheck' })).toBeDefined()
   await ui.unmount()
   const out = await $.tool.call({ tool: 'mcp__easel__new', asset: 'fox', prompt: '狐狸' } as never)
-  const deny = String((out as { deny?: string }).deny)
+  const deny = refused(out)
   expect(deny).toContain('管理工具的方式')
   expect(deny).not.toContain('curl')
 })
@@ -271,7 +305,7 @@ test('沒登入時面板給登入鈕，工具也拒絕', async ($, on) => {
   expect(await ui.find({ key: 'login' })).toBeDefined()
   await ui.unmount()
   const out = await $.tool.call({ tool: 'mcp__easel__new', asset: 'fox', prompt: '狐狸' } as never)
-  expect('deny' in out && String(out.deny)).toContain('登入')
+  expect(refused(out)).toContain('登入')
 })
 
 test('新圖：多一張新圖才算數，紀錄寫進 meta.json，不再靠模型複製', async ($, on) => {
@@ -279,7 +313,7 @@ test('新圖：多一張新圖才算數，紀錄寫進 meta.json，不再靠模�
   const w = world(on, { images: [image] })
   await start($)
   const out = await $.tool.call({ tool: 'mcp__easel__new', asset: 'fox', prompt: '狐狸', transparent: false } as never)
-  expect(JSON.stringify(out)).toContain('v1.png')
+  expect(served(out)).toContain('v1.png')
   expect(w.runs.some(argv => argv[0] === 'cp' && argv[1] === image && argv[2] === `${CWD}/art/fox/v1.png`)).toBe(true)
   const saved = JSON.parse(w.files[`${CWD}/art/fox/meta.json`] ?? '{}') as EaselMeta
   expect(saved.versions[0]?.threadId).toBe(THREAD)
@@ -292,7 +326,7 @@ test('Codex 說完成但沒有新圖：不算數，也不留下版本', async ($
   const w = world(on, { images: [] })
   await start($)
   const out = await $.tool.call({ tool: 'mcp__easel__new', asset: 'fox', prompt: '狐狸' } as never)
-  expect(String((out as { deny?: string }).deny)).toContain('不算數')
+  expect(refused(out)).toContain('不算數')
   expect(w.files[`${CWD}/art/fox/meta.json`]).toBeUndefined()
   await openPane($)
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
@@ -311,14 +345,14 @@ test('修改：接回畫底圖那段對話並附上底圖，失敗的 turn 會�
   const argv = w.spawns[0]?.argv ?? []
   expect(argv.slice(argv.indexOf('resume'))).toEqual(['resume', 'thread-2', '-', '-i', `${CWD}/art/fox/v2.png`])
   expect(w.spawns[0]?.input).toContain('v2')
-  expect(JSON.stringify(out)).toContain('不算數')
+  expect(refused(out)).toContain('不算數')
 })
 
 test('同一個素材不能同時畫：鎖拿不到就拒絕', async ($, on) => {
   const w = world(on, { metas: [meta('fox', [version(1)])], locked: true })
   await start($)
   const out = await $.tool.call({ tool: 'mcp__easel__revise', asset: 'fox', prompt: '改' } as never)
-  expect(String((out as { deny?: string }).deny)).toContain('正在畫')
+  expect(refused(out)).toContain('正在畫')
   expect(w.spawns.length).toBe(0)
 })
 
@@ -326,9 +360,9 @@ test('素材名不合法、重複開新素材都拒絕', async ($, on) => {
   world(on, { metas: [meta('fox', [version(1)])] })
   await start($)
   const bad = await $.tool.call({ tool: 'mcp__easel__new', asset: '../x', prompt: 'p' } as never)
-  expect(String((bad as { deny?: string }).deny)).toContain('素材名')
+  expect(refused(bad)).toContain('素材名')
   const dup = await $.tool.call({ tool: 'mcp__easel__new', asset: 'fox', prompt: 'p' } as never)
-  expect(String((dup as { deny?: string }).deny)).toContain('已經存在')
+  expect(refused(dup)).toContain('已經存在')
 })
 
 test('自檢結果寫回去，面板看得到', async ($, on) => {
@@ -428,7 +462,7 @@ test('同一段對話多出好幾張時收最新的那張：看修改時間，�
   })
   await start($)
   const out = await $.tool.call({ tool: 'mcp__easel__revise', asset: 'fox', prompt: '圍巾改紅' } as never)
-  expect(JSON.stringify(out)).toContain('v2.png')
+  expect(served(out)).toContain('v2.png')
   const copies = w.runs.filter(argv => argv[0] === 'cp')
   expect(copies).toEqual([['cp', `${dir}/final.png`, `${CWD}/art/fox/v2.png`]])
   expect(w.runs.some(argv => argv[0] === 'find' && argv.join(' ').includes('generated_images'))).toBe(false)
@@ -438,7 +472,7 @@ test('Codex 跑完但生圖資料夾讀不到：照實說圖可能已經畫好�
   const w = world(on, { unreadable: [`${IMAGES}/${THREAD}`] })
   await start($)
   const out = await $.tool.call({ tool: 'mcp__easel__new', asset: 'fox', prompt: '狐狸' } as never)
-  const deny = String((out as { deny?: string }).deny)
+  const deny = refused(out)
   expect(deny).toContain('讀不到生圖資料夾')
   expect(deny).not.toContain('不算數')
   expect(w.files[`${CWD}/art/fox/meta.json`]).toBeUndefined()
@@ -501,9 +535,9 @@ test('/easel 指令被引擎拒絕：四個工具照樣註冊、照樣能畫，�
   expect(w.logs[0]).toContain('refused')
 
   const drawn = await $.tool.call({ tool: 'mcp__easel__new', asset: 'fox', prompt: '狐狸' } as never)
-  expect(JSON.stringify(drawn)).toContain('v1.png')
+  expect(served(drawn)).toContain('v1.png')
   const status = await $.tool.call({ tool: 'mcp__easel__status' } as never)
-  expect(JSON.stringify(status)).toContain('/easel 指令')
+  expect(served(status)).toContain('/easel 指令')
 
   for (const surface of ['desktop', 'terminal'] as const) {
     // /easel 開不了面板時，對話框上方那一列的「打開」是僅有的入口：按下去要回到首頁，首頁要看得到原因
@@ -611,3 +645,41 @@ for (const [name, uname, tool, ext, mime] of [
     await ui.unmount()
   })
 }
+
+// ---- 工具在權限檢查之後服務（tool.run），不在 tool.call ------------------------------
+// 起因：2.1.326 起內建的 sec-default 會擋「權限檢查之前」由外掛啟動的程式。easel 原本在 tool.call 服務，
+// 真引擎上每次生圖都回「Codex 沒畫出來：$.process.spawn: this repeats a Bash call that is not allowed…」。
+// 當時的替身一律放行 spawn，所以測試全綠。現在替身照 sec-default 擋，並記下哪些呼叫走過權限檢查。
+
+test('四個工具都等權限檢查通過才服務：每次呼叫都走過檢查，生圖照樣啟動 codex', async ($, on) => {
+  const w = world(on, { metas: [meta('cabin', [version(1)])], images: [`${IMAGES}/${THREAD}/exec-a.png`] })
+  await start($)
+  expect(served(await $.tool.call({ tool: 'mcp__easel__revise', asset: 'cabin', prompt: '屋頂改紅' } as never))).toContain('v2.png')
+  expect(served(await $.tool.call({ tool: 'mcp__easel__new', asset: 'fox', prompt: '狐狸' } as never))).toContain('v1.png')
+  expect(served(await $.tool.call({ tool: 'mcp__easel__self_check', asset: 'fox', version: 1, pass: true, note: '對' } as never))).toContain('已記錄')
+  expect(served(await $.tool.call({ tool: 'mcp__easel__status' } as never))).toContain('fox')
+  // 有哪一個改回 tool.call，引擎就跳過權限檢查，這裡會少一筆；new、revise 還會被替身擋下、畫不出來
+  expect(w.checked).toEqual(['mcp__easel__revise', 'mcp__easel__new', 'mcp__easel__self_check', 'mcp__easel__status'])
+  expect(w.spawns.length).toBe(2)
+})
+
+test('對照：沒走權限檢查就啟動 codex 會被擋（替身照真引擎），easel 照實回報沒畫出來、不留版本', async ($, on) => {
+  const w = world(on, { images: [`${IMAGES}/${THREAD}/exec-a.png`] })
+  await start($)
+  // 直接觸發 tool.run、跳過權限檢查：等於工具在檢查之前就 spawn
+  const out = await $.tool.run({ tool: 'mcp__easel__new', tool_use_id: 'toolu_skip', asset: 'fox', prompt: '狐狸' } as never)
+  expect(String((out as Out).deny)).toContain('沒畫出來')
+  expect(w.spawns.length).toBe(0)
+  expect(w.files[`${CWD}/art/fox/meta.json`]).toBeUndefined()
+})
+
+test('權限檢查不允許：不啟動 codex、不上鎖、不寫紀錄，不花額度', async ($, on) => {
+  const w = world(on, { denyPermission: '使用者不允許', images: [`${IMAGES}/${THREAD}/exec-a.png`] })
+  await start($)
+  const out = await $.tool.call({ tool: 'mcp__easel__new', asset: 'fox', prompt: '狐狸' } as never)
+  expect(refused(out)).toContain('使用者不允許')
+  expect(w.checked).toEqual(['mcp__easel__new'])
+  expect(w.spawns.length).toBe(0)
+  expect(w.runs.some(argv => argv[0] === 'mkdir' && argv.join(' ').includes('/art/fox/'))).toBe(false)
+  expect(w.files[`${CWD}/art/fox/meta.json`]).toBeUndefined()
+})

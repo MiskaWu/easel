@@ -428,17 +428,21 @@ export const register: Register = on => {
     return { text: 'easel 面板已開啟。' }
   })
 
-  on('tool.call', { tool: 'mcp__easel__new' }, ($, e) => startNew($, e as unknown as NewInput)).catch(() => ({ deny: 'easel 內部出錯，這次沒有畫。' }))
-  on('tool.call', { tool: 'mcp__easel__revise' }, ($, e) => startRevise($, e as unknown as ReviseInput)).catch(() => ({ deny: 'easel 內部出錯，這次沒有畫。' }))
+  // 四個工具一律在 tool.run 服務（權限檢查通過、真的要執行的那一刻），不在 tool.call（權限檢查之前）。
+  // 2.1.326 起內建的 sec-default 會擋「權限檢查之前」由外掛啟動的外部程式：在 tool.call 裡 spawn codex 會得到
+  // 「$.process.spawn: this repeats a Bash call that is not allowed; serve an allowed call at tool.run」，事先允許工具也一樣。
+  // 這裡的 { deny } 是這次呼叫的錯誤（和工具自己出錯一樣），模型讀得到原因。
+  on('tool.run', { tool: 'mcp__easel__new' }, ($, e) => startNew($, e as unknown as NewInput)).catch(() => ({ deny: 'easel 內部出錯，這次沒有畫。' }))
+  on('tool.run', { tool: 'mcp__easel__revise' }, ($, e) => startRevise($, e as unknown as ReviseInput)).catch(() => ({ deny: 'easel 內部出錯，這次沒有畫。' }))
 
-  on('tool.call', { tool: 'mcp__easel__self_check' }, async ($, e) => {
+  on('tool.run', { tool: 'mcp__easel__self_check' }, async ($, e) => {
     const { asset, version, pass, note = '' } = e as unknown as CheckInput
     if (!asset || version === undefined) return { deny: '缺素材名或版本。' }
     const done = await changeVersion($, asset, version, { selfCheck: pass ? 'pass' : 'fail', selfNote: note })
     return done ? { result: `已記錄 ${asset} v${version} 的自檢。` } : { deny: `找不到 ${asset} v${version}。` }
   }).catch(() => ({ deny: 'easel 內部出錯，沒有記錄。' }))
 
-  on('tool.call', { tool: 'mcp__easel__status' }, async $ => {
+  on('tool.run', { tool: 'mcp__easel__status' }, async $ => {
     await ready($)
     if (!(await read($, usageAtom))) await refreshUsage($)
     const assets = await refreshAssets($)
@@ -452,6 +456,7 @@ export const register: Register = on => {
   }).catch(() => ({ deny: 'easel 內部出錯，查不到狀態。' }))
 
   // Claude 自己叫 codex 生圖的話，easel 收不到圖也沒有檢查。其他 codex 用法不受影響。
+  // 這個是閘門，要在權限檢查之前擋，所以留在 tool.call；它不啟動任何程式。
   on('tool.call', { tool: 'Bash' }, ($, e, next) => (isDirectImageCall(e.command) ? { deny: '生圖請用 easel 的 new 或 revise 工具，不要直接呼叫 codex。' } : next(e))).catch(($, e, next) => next(e))
 
   // 對話框上方：有事才出現，一次只講最要緊的一件。照 mod 共用的約定疊在下層上面，不獨佔。

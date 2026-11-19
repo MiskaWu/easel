@@ -48,6 +48,8 @@
 
 **支援 Linux、Windows 的 WSL 與 macOS。** Windows 原生目前跑不起來。
 
+**Claude Code 要 2.1.326 以上**（`claude --version`）。2.1.323 到 2.1.325 會自動裝到舊的 0.1.2，照常能用；更舊的請先更新 Claude Code。
+
 macOS 在 27.2 上驗證。easel 用系統內建的 `timeout` 限制單次生圖的等待時間，沒有這個指令的舊版 macOS 不支援（終端機打 `command -v timeout` 有結果就可以）。
 
 ### 1. 先準備工具
@@ -102,6 +104,7 @@ claude plugin marketplace update easel && claude plugin update easel@easel
 1. 確認是 Linux、WSL 或 macOS。Windows 原生就停下來，告訴使用者目前不支援。macOS 再跑 `command -v timeout`，沒有結果也停下來，告訴使用者這版 macOS 太舊。
 2. 決定用哪個 `claude`：`command -v claude` 有結果就用它；沒有的話用環境變數 `$CLAUDE_CODE_EXECPATH`
    （目前這個 Claude Code 本身，桌面 app 的 Code 分頁裡也有）。以下記作 `$CLAUDE`。
+   跑 `"$CLAUDE" --version`：低於 2.1.323 就停下來，請使用者先更新 Claude Code（更舊的版本會裝到它跑不動的新版）。
 3. 加入 marketplace：`"$CLAUDE" plugin marketplace add MiskaWu/easel`。
    已經加過的話改跑 `"$CLAUDE" plugin marketplace update easel`。
 4. 安裝：`"$CLAUDE" plugin install easel@easel`。已經裝過的話改跑 `"$CLAUDE" plugin update easel@easel`。

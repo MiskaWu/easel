@@ -1,7 +1,7 @@
 {
   "name": "easel",
   "owner": { "name": "MiskaWu", "url": "https://github.com/MiskaWu" },
-  "metadata": { "description": "用官方 Codex 生圖，在 Claude 裡審稿。", "version": "0.1.2" },
+  "metadata": { "description": "用官方 Codex 生圖，在 Claude 裡審稿。", "version": "0.1.3" },
   "plugins": [
     {
       "name": "easel",
